@@ -12,6 +12,7 @@ import { hideBin } from "yargs/helpers";
 import { createAuthenticator } from "./auth.js";
 import { logger } from "./logger.js";
 import { getOrgTenant } from "./org-tenants.js";
+import { resolveOrgUrl } from "./org-url.js";
 //import { configurePrompts } from "./prompts.js";
 import { configureAllTools } from "./tools.js";
 import { UserAgentComposer } from "./useragent.js";
@@ -55,11 +56,18 @@ const argv = yargs(hideBin(process.argv))
     describe: "Azure tenant ID (optional, applied when using 'interactive' and 'azcli' type of authentication)",
     type: "string",
   })
+  .option("url", {
+    alias: "u",
+    describe:
+      "Full Azure DevOps organization/collection URL, for on-premises Azure DevOps Server (e.g. https://tfs.example.com/tfs/DefaultCollection). Overrides the default dev.azure.com URL built from <organization>. The <organization> argument may also be given as a full URL directly. Must already be percent-encoded (e.g. a collection name with spaces: Samlet%20Portef%C3%B8lje) — it is used as-is.",
+    type: "string",
+  })
   .help()
   .parseSync();
 
 export const orgName = argv.organization as string;
-const orgUrl = "https://dev.azure.com/" + orgName;
+const { orgUrl, isOnPremises } = resolveOrgUrl(orgName, argv.url as string | undefined);
+export { isOnPremises };
 
 const domainsManager = new DomainsManager(argv.domains);
 export const enabledDomains = domainsManager.getEnabledDomains();
@@ -83,6 +91,7 @@ async function main() {
   logger.info("Starting Azure DevOps MCP Server", {
     organization: orgName,
     organizationUrl: orgUrl,
+    onPremises: isOnPremises,
     authentication: argv.authentication,
     tenant: argv.tenant,
     domains: argv.domains,
@@ -90,6 +99,12 @@ async function main() {
     version: packageVersion,
     isCodespace: isGitHubCodespaceEnv(),
   });
+
+  if (isOnPremises && enabledDomains.has("search")) {
+    logger.error(
+      "The 'search' domain (code/wiki/work-item/commit search) calls Azure DevOps Services cloud endpoints (almsearch.dev.azure.com) and does not work against on-premises Azure DevOps Server. Its tools will fail if invoked."
+    );
+  }
 
   const server = new McpServer({
     name: "Azure DevOps MCP Server",
@@ -105,7 +120,9 @@ async function main() {
   server.server.oninitialized = () => {
     userAgentComposer.appendMcpClientInfo(server.server.getClientVersion());
   };
-  const tenantId = (await getOrgTenant(orgName)) ?? argv.tenant;
+  // getOrgTenant looks up the Azure AD tenant via a cloud-only endpoint (vssps.dev.azure.com);
+  // that lookup is meaningless (and always fails) for an on-premises server, so skip it.
+  const tenantId = (isOnPremises ? undefined : await getOrgTenant(orgName)) ?? argv.tenant;
   const authenticator = createAuthenticator(argv.authentication, tenantId);
 
   if (argv.authentication === "pat") {

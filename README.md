@@ -167,6 +167,32 @@ Open GitHub Copilot Chat and try a prompt like `List ADO projects`. The first ti
 
 See the [getting started documentation](./docs/GETTINGSTARTED.md) to use our MCP Server with other tools such as Visual Studio 2022, Codex, Claude Code, and Cursor.
 
+## 🏢 On-Premises Azure DevOps Server Support (fork addition)
+
+This fork adds support for on-premises **Azure DevOps Server** (Server/TFS), which the upstream project only supports for Azure DevOps **Services** (`dev.azure.com`). Use the `-u`/`--url` option (or pass a full URL directly as `<organization>`) together with `pat` authentication:
+
+```json
+{
+  "servers": {
+    "ado": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp", "myorg", "--url", "https://tfs.example.com/tfs/DefaultCollection", "--authentication", "pat"],
+      "env": {
+        "PERSONAL_ACCESS_TOKEN": "<base64 of \":<your PAT>\">"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- `--url` must already be percent-encoded (e.g. a collection name with spaces: `Samlet%20Portef%C3%B8lje`) — it's used as-is, not re-encoded.
+- `PERSONAL_ACCESS_TOKEN` is base64 of `":<PAT>"` (empty username), same format the cloud `pat` auth type already expects — no on-prem-specific auth code was needed.
+- If your server uses an internal/self-signed CA certificate, run Node with system CA trust: set `NODE_OPTIONS=--use-system-ca` (requires a recent Node.js, 22+) so Node picks up the OS certificate store instead of failing with `unable to get local issuer certificate`. Avoid `NODE_TLS_REJECT_UNAUTHORIZED=0` — it disables certificate validation entirely.
+- **Known limitation:** the `search` domain (code/wiki/work-item/commit search tools) and the identity-lookup helper behind `azure-devops-node-api`'s search-by-identity calls hit Azure DevOps Services-only endpoints (`almsearch.dev.azure.com`, `vssps.dev.azure.com`) and do not work against an on-premises server. All other domains (work-items, test-plans, repositories, pull-requests, pipelines, wiki, core) work normally once connected via `--url`.
+
 ## 🌏 Using Domains (local)
 
 Azure DevOps exposes a large surface area. As a result, our Azure DevOps MCP Server includes many tools. To keep the toolset manageable, avoid confusing the model, and respect client limits on loaded tools, use Domains to load only the areas you need. Domains are named groups of related tools (for example: core, work, work-items, repositories, wiki). Add the `-d` argument and the domain names to the server args in your `mcp.json` to list the domains to enable.
