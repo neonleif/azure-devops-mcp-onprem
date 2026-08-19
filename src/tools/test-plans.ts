@@ -226,22 +226,26 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
       testCaseIds: z.string().or(z.array(z.string())).describe("The ID(s) of the test case(s) to remove from the suite. Comma-separated string or array."),
     },
     async ({ project, planId, suiteId, testCaseIds }) => {
+      // Normalise to a clean list first: an empty id string would make the SDK drop the
+      // {testCaseIds} route segment and send DELETE to the suite's whole test-case collection.
+      const ids = (Array.isArray(testCaseIds) ? testCaseIds : testCaseIds.split(",")).map((id) => String(id).trim()).filter((id) => id.length > 0);
+      if (ids.length === 0) {
+        return {
+          content: [{ type: "text", text: "Error removing test cases from suite: testCaseIds must contain at least one test case id" }],
+          isError: true,
+        };
+      }
+      const testCaseIdsString = ids.join(",");
+
       try {
         const connection = await connectionProvider();
         const testApi = await connection.getTestApi();
 
-        // If testCaseIds is an array, convert it to comma-separated string
-        const testCaseIdsString = Array.isArray(testCaseIds) ? testCaseIds.join(",") : testCaseIds;
-
         await testApi.removeTestCasesFromSuiteUrl(project, planId, suiteId, testCaseIdsString);
 
+        // The SDK call returns void, so the ids below are the ones requested, not a server confirmation.
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ planId, suiteId, removedTestCaseIds: testCaseIdsString.split(",").map((id) => id.trim()) }, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify({ planId, suiteId, removedTestCaseIds: ids }, null, 2) }],
         };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";

@@ -2590,7 +2590,49 @@ describe("configureTestPlanTools", () => {
       };
       const result = await handler(params);
 
-      expect(mockTestApi.removeTestCasesFromSuiteUrl).toHaveBeenCalledWith("proj1", 1, 2, "1003, 1004");
+      expect(mockTestApi.removeTestCasesFromSuiteUrl).toHaveBeenCalledWith("proj1", 1, 2, "1003,1004");
+      expect(JSON.parse(result.content[0].text)).toEqual({ planId: 1, suiteId: 2, removedTestCaseIds: ["1003", "1004"] });
+    });
+
+    it("should accept numeric IDs in the array like add_test_cases_to_suite", async () => {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_remove_test_cases_from_suite");
+      if (!call) throw new Error("testplan_remove_test_cases_from_suite tool not registered");
+      const [, , , handler] = call;
+
+      (mockTestApi.removeTestCasesFromSuiteUrl as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await handler({ project: "proj1", planId: 1, suiteId: 2, testCaseIds: [1001, 1002] });
+
+      expect(mockTestApi.removeTestCasesFromSuiteUrl).toHaveBeenCalledWith("proj1", 1, 2, "1001,1002");
+      expect(JSON.parse(result.content[0].text)).toEqual({ planId: 1, suiteId: 2, removedTestCaseIds: ["1001", "1002"] });
+    });
+
+    it("should reject empty or blank testCaseIds without calling the API", async () => {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_remove_test_cases_from_suite");
+      if (!call) throw new Error("testplan_remove_test_cases_from_suite tool not registered");
+      const [, , , handler] = call;
+
+      for (const testCaseIds of [[], "", " , ", [" "]]) {
+        const result = await handler({ project: "proj1", planId: 1, suiteId: 2, testCaseIds });
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("at least one test case id");
+      }
+      expect(mockTestApi.removeTestCasesFromSuiteUrl).not.toHaveBeenCalled();
+    });
+
+    it("should drop blank entries and keep the rest", async () => {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_remove_test_cases_from_suite");
+      if (!call) throw new Error("testplan_remove_test_cases_from_suite tool not registered");
+      const [, , , handler] = call;
+
+      (mockTestApi.removeTestCasesFromSuiteUrl as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await handler({ project: "proj1", planId: 1, suiteId: 2, testCaseIds: "1003, ,1004," });
+
+      expect(mockTestApi.removeTestCasesFromSuiteUrl).toHaveBeenCalledWith("proj1", 1, 2, "1003,1004");
       expect(JSON.parse(result.content[0].text)).toEqual({ planId: 1, suiteId: 2, removedTestCaseIds: ["1003", "1004"] });
     });
 

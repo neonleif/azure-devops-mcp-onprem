@@ -461,7 +461,7 @@ Adds existing test cases to a test suite.
 
 ### mcp_ado_testplan_remove_test_cases_from_suite
 
-Removes test cases from a test suite. Only the suite membership is removed; the test case work items are not deleted and remain in any other suites they belong to. `testCaseIds` accepts a comma-separated string or an array of IDs.
+Removes test cases from a test suite. Only the suite membership is removed; the test case work items themselves are not deleted and stay in any other suites they belong to. `testCaseIds` accepts a comma-separated string or an array of IDs; an empty list is rejected before any API call.
 
 - **Required**: `project`, `planId`, `suiteId`, `testCaseIds`
 - **Optional**: None
