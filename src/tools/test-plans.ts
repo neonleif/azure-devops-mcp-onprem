@@ -12,6 +12,7 @@ const Test_Plan_Tools = {
   create_test_case: "testplan_create_test_case",
   update_test_case_steps: "testplan_update_test_case_steps",
   add_test_cases_to_suite: "testplan_add_test_cases_to_suite",
+  remove_test_cases_from_suite: "testplan_remove_test_cases_from_suite",
   test_results_from_build_id: "testplan_show_test_results_from_build_id",
   list_test_cases: "testplan_list_test_cases",
   list_test_plans: "testplan_list_test_plans",
@@ -209,6 +210,50 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
         return {
           content: [{ type: "text", text: `Error adding test cases to suite: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.remove_test_cases_from_suite,
+    "Removes test cases from a test suite. Only the suite membership is removed; the test case work items themselves are not deleted and stay in any other suites they belong to.",
+    {
+      project: z.string().describe("The unique identifier (ID or name) of the Azure DevOps project."),
+      planId: z.coerce.number().min(1).describe("The ID of the test plan."),
+      suiteId: z.coerce.number().min(1).describe("The ID of the test suite to remove the test cases from."),
+      testCaseIds: z
+        .string()
+        .or(z.array(z.string().or(z.number())))
+        .describe("The ID(s) of the test case(s) to remove from the suite. Comma-separated string, or an array of ids (strings or numbers)."),
+    },
+    async ({ project, planId, suiteId, testCaseIds }) => {
+      // Normalise to a clean list first: an empty id string would make the SDK drop the
+      // {testCaseIds} route segment and send DELETE to the suite's whole test-case collection.
+      const ids = (Array.isArray(testCaseIds) ? testCaseIds : testCaseIds.split(",")).map((id) => String(id).trim()).filter((id) => id.length > 0);
+      if (ids.length === 0) {
+        return {
+          content: [{ type: "text", text: "Error removing test cases from suite: testCaseIds must contain at least one test case id" }],
+          isError: true,
+        };
+      }
+      const testCaseIdsString = ids.join(",");
+
+      try {
+        const connection = await connectionProvider();
+        const testApi = await connection.getTestApi();
+
+        await testApi.removeTestCasesFromSuiteUrl(project, planId, suiteId, testCaseIdsString);
+
+        // The SDK call returns void, so the ids below are the ones requested, not a server confirmation.
+        return {
+          content: [{ type: "text", text: JSON.stringify({ planId, suiteId, removedTestCaseIds: ids }, null, 2) }],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error removing test cases from suite: ${errorMessage}` }],
           isError: true,
         };
       }
