@@ -51,6 +51,7 @@
 | Test Plans        | [mcp_ado_testplan_list_test_suites](#mcp_ado_testplan_list_test_suites)                                   | List test suites in a test plan                                   |
 | Test Plans        | [mcp_ado_testplan_create_test_suite](#mcp_ado_testplan_create_test_suite)                                 | Create a test suite within a test plan                            |
 | Test Plans        | [mcp_ado_testplan_add_test_cases_to_suite](#mcp_ado_testplan_add_test_cases_to_suite)                     | Add test cases to a test suite                                    |
+| Test Plans        | [mcp_ado_testplan_remove_test_cases_from_suite](#mcp_ado_testplan_remove_test_cases_from_suite)           | Remove test cases from a test suite                               |
 | Test Plans        | [mcp_ado_testplan_list_test_cases](#mcp_ado_testplan_list_test_cases)                                     | List test cases in a test suite                                   |
 | Test Plans        | [mcp_ado_testplan_create_test_case](#mcp_ado_testplan_create_test_case)                                   | Create a new test case work item                                  |
 | Test Plans        | [mcp_ado_testplan_update_test_case_steps](#mcp_ado_testplan_update_test_case_steps)                       | Update steps of an existing test case                             |
@@ -454,6 +455,13 @@ Creates a new test suite in a test plan.
 ### mcp_ado_testplan_add_test_cases_to_suite
 
 Adds existing test cases to a test suite.
+
+- **Required**: `project`, `planId`, `suiteId`, `testCaseIds`
+- **Optional**: None
+
+### mcp_ado_testplan_remove_test_cases_from_suite
+
+Removes test cases from a test suite. Only the suite membership is removed; the test case work items are not deleted and remain in any other suites they belong to. `testCaseIds` accepts a comma-separated string or an array of IDs.
 
 - **Required**: `project`, `planId`, `suiteId`, `testCaseIds`
 - **Optional**: None

@@ -12,6 +12,7 @@ const Test_Plan_Tools = {
   create_test_case: "testplan_create_test_case",
   update_test_case_steps: "testplan_update_test_case_steps",
   add_test_cases_to_suite: "testplan_add_test_cases_to_suite",
+  remove_test_cases_from_suite: "testplan_remove_test_cases_from_suite",
   test_results_from_build_id: "testplan_show_test_results_from_build_id",
   list_test_cases: "testplan_list_test_cases",
   list_test_plans: "testplan_list_test_plans",
@@ -209,6 +210,43 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
         return {
           content: [{ type: "text", text: `Error adding test cases to suite: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.remove_test_cases_from_suite,
+    "Removes test cases from a test suite. Only the suite membership is removed; the test case work items themselves are not deleted and stay in any other suites they belong to.",
+    {
+      project: z.string().describe("The unique identifier (ID or name) of the Azure DevOps project."),
+      planId: z.coerce.number().min(1).describe("The ID of the test plan."),
+      suiteId: z.coerce.number().min(1).describe("The ID of the test suite to remove the test cases from."),
+      testCaseIds: z.string().or(z.array(z.string())).describe("The ID(s) of the test case(s) to remove from the suite. Comma-separated string or array."),
+    },
+    async ({ project, planId, suiteId, testCaseIds }) => {
+      try {
+        const connection = await connectionProvider();
+        const testApi = await connection.getTestApi();
+
+        // If testCaseIds is an array, convert it to comma-separated string
+        const testCaseIdsString = Array.isArray(testCaseIds) ? testCaseIds.join(",") : testCaseIds;
+
+        await testApi.removeTestCasesFromSuiteUrl(project, planId, suiteId, testCaseIdsString);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ planId, suiteId, removedTestCaseIds: testCaseIdsString.split(",").map((id) => id.trim()) }, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error removing test cases from suite: ${errorMessage}` }],
           isError: true,
         };
       }
