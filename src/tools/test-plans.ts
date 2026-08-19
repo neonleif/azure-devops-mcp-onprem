@@ -223,7 +223,10 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
       project: z.string().describe("The unique identifier (ID or name) of the Azure DevOps project."),
       planId: z.coerce.number().min(1).describe("The ID of the test plan."),
       suiteId: z.coerce.number().min(1).describe("The ID of the test suite to remove the test cases from."),
-      testCaseIds: z.string().or(z.array(z.string())).describe("The ID(s) of the test case(s) to remove from the suite. Comma-separated string or array."),
+      testCaseIds: z
+        .string()
+        .or(z.array(z.string().or(z.number())))
+        .describe("The ID(s) of the test case(s) to remove from the suite. Comma-separated string, or an array of ids (strings or numbers)."),
     },
     async ({ project, planId, suiteId, testCaseIds }) => {
       // Normalise to a clean list first: an empty id string would make the SDK drop the

@@ -9,6 +9,7 @@ import { ITestPlanApi } from "azure-devops-node-api/TestPlanApi";
 import { ITestResultsApi } from "azure-devops-node-api/TestResultsApi";
 import { IWorkItemTrackingApi } from "azure-devops-node-api/WorkItemTrackingApi";
 import { ITestApi } from "azure-devops-node-api/TestApi";
+import { z } from "zod";
 
 type TokenProviderMock = () => Promise<string>;
 type ConnectionProviderMock = () => Promise<WebApi>;
@@ -2594,11 +2595,17 @@ describe("configureTestPlanTools", () => {
       expect(JSON.parse(result.content[0].text)).toEqual({ planId: 1, suiteId: 2, removedTestCaseIds: ["1003", "1004"] });
     });
 
-    it("should accept numeric IDs in the array like add_test_cases_to_suite", async () => {
+    it("should accept numeric IDs in the array at the schema boundary and in the handler", async () => {
       configureTestPlanTools(server, tokenProvider, connectionProvider);
       const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_remove_test_cases_from_suite");
       if (!call) throw new Error("testplan_remove_test_cases_from_suite tool not registered");
-      const [, , , handler] = call;
+      const [, , schema, handler] = call;
+
+      // The registered zod schema must accept what the handler accepts: string, string[] and number[].
+      const parsed = z.object(schema).safeParse({ project: "proj1", planId: 1, suiteId: 2, testCaseIds: [1001, 1002] });
+      expect(parsed.success).toBe(true);
+      expect(z.object(schema).safeParse({ project: "proj1", planId: 1, suiteId: 2, testCaseIds: ["1001", "1002"] }).success).toBe(true);
+      expect(z.object(schema).safeParse({ project: "proj1", planId: 1, suiteId: 2, testCaseIds: "1001,1002" }).success).toBe(true);
 
       (mockTestApi.removeTestCasesFromSuiteUrl as jest.Mock).mockResolvedValue(undefined);
 
