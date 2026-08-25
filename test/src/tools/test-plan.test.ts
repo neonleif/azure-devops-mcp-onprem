@@ -79,6 +79,7 @@ describe("configureTestPlanTools", () => {
           "testplan_create_test_case",
           "testplan_update_test_case_steps",
           "testplan_list_test_cases",
+          "testplan_list_test_points",
           "testplan_show_test_results_from_build_id",
           "testplan_list_test_suites",
         ])
@@ -696,6 +697,131 @@ describe("configureTestPlanTools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Failed to list test cases (404)");
       expect(result.content[0].text).toContain("Test case not found");
+    });
+  });
+
+  describe("list_test_points tool", () => {
+    function mockFetchPointsResponse(value: any[], continuationToken?: string, ok = true, status = 200, errorText = "Not Found") {
+      const headers = new Map<string, string>();
+      if (continuationToken) {
+        headers.set("x-ms-continuationtoken", continuationToken);
+      }
+      (global.fetch as jest.Mock) = jest.fn().mockResolvedValue({
+        ok,
+        status,
+        statusText: ok ? "OK" : "Not Found",
+        json: jest.fn().mockResolvedValue({ value }),
+        text: jest.fn().mockResolvedValue(errorText),
+        headers: { get: (key: string) => headers.get(key) ?? null },
+      });
+    }
+
+    function getHandler() {
+      configureTestPlanTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_list_test_points");
+      if (!call) throw new Error("testplan_list_test_points tool not registered");
+      return call[3];
+    }
+
+    const passedPoint = {
+      id: 279,
+      testCaseReference: { id: 9053, name: "8930 D4: Loftet handhaeves" },
+      configuration: { name: "Windows 10" },
+      tester: { displayName: "Nicolaj Schweitz" },
+      isAutomated: false,
+      results: { outcome: "passed", lastResultState: "Completed", lastResultDetails: { dateCompleted: "2026-08-25T07:00:00Z" } },
+    };
+
+    const neverRunPoint = {
+      id: 280,
+      testCaseReference: { id: 9054, name: "8930 D5: Under 18 med ekstra" },
+      configuration: { name: "Windows 10" },
+      tester: { displayName: "Nicolaj Schweitz" },
+      isAutomated: false,
+      results: { outcome: "unspecified" },
+    };
+
+    it("returns compact rows and a count per outcome", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint, neverRunPoint]);
+
+      const result = await handler({ project: "proj1", planid: 9105, suiteid: 9241, includePointDetails: false });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("proj1/_apis/testplan/Plans/9105/Suites/9241/TestPoint"), expect.objectContaining({ method: "GET" }));
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.planId).toBe(9105);
+      expect(parsed.suiteId).toBe(9241);
+      expect(parsed.summary).toEqual({ total: 2, byOutcome: { Passed: 1, Active: 1 } });
+      expect(parsed.testPoints).toEqual([
+        {
+          id: 279,
+          testCaseId: 9053,
+          testCaseName: "8930 D4: Loftet handhaeves",
+          outcome: "Passed",
+          lastResultState: "Completed",
+          tester: "Nicolaj Schweitz",
+          configuration: "Windows 10",
+          isAutomated: false,
+          lastUpdatedDate: "2026-08-25T07:00:00Z",
+        },
+        {
+          id: 280,
+          testCaseId: 9054,
+          testCaseName: "8930 D5: Under 18 med ekstra",
+          outcome: "Active",
+          lastResultState: undefined,
+          tester: "Nicolaj Schweitz",
+          configuration: "Windows 10",
+          isAutomated: false,
+          lastUpdatedDate: undefined,
+        },
+      ]);
+    });
+
+    it("reports a missing outcome as Active", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([{ id: 1, testCaseReference: { id: 2, name: "No results yet" } }]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.testPoints[0].outcome).toBe("Active");
+      expect(parsed.summary.byOutcome).toEqual({ Active: 1 });
+    });
+
+    it("returns the raw objects when includePointDetails is true", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: true });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("includePointDetails=true"), expect.anything());
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.testPoints).toEqual([passedPoint]);
+      expect(parsed.summary.byOutcome).toEqual({ Passed: 1 });
+    });
+
+    it("passes testCaseId and the continuation token", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint], "nextToken789");
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, testCaseId: "9053", includePointDetails: false, continuationToken: "token123" });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("testCaseId=9053"), expect.anything());
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("continuationToken=token123"), expect.anything());
+      expect(JSON.parse(result.content[0].text).continuationToken).toBe("nextToken789");
+    });
+
+    it("handles a non-ok response with status and error text", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([], undefined, false, 404, "Suite not found");
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Failed to list test points (404)");
+      expect(result.content[0].text).toContain("Suite not found");
     });
   });
 

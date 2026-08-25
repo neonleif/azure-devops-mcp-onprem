@@ -15,6 +15,7 @@ const Test_Plan_Tools = {
   remove_test_cases_from_suite: "testplan_remove_test_cases_from_suite",
   test_results_from_build_id: "testplan_show_test_results_from_build_id",
   list_test_cases: "testplan_list_test_cases",
+  list_test_points: "testplan_list_test_points",
   list_test_plans: "testplan_list_test_plans",
   list_test_suites: "testplan_list_test_suites",
   create_test_suite: "testplan_create_test_suite",
@@ -461,6 +462,78 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
   );
 
   server.tool(
+    Test_Plan_Tools.list_test_points,
+    "Gets the test points of a test suite together with their execution outcome, so manual execution status can be read instead of tallied by hand. Returns one compact row per point (point id, test case id and name, outcome, tester, configuration, when it was last set) plus a count per outcome. A point that has never been run reports the outcome 'Active'. Set includePointDetails to true to get the raw Azure DevOps objects instead of the compact rows.",
+    {
+      project: z.string().describe("The unique identifier (ID or name) of the Azure DevOps project."),
+      planid: z.coerce.number().min(1).describe("The ID of the test plan."),
+      suiteid: z.coerce.number().min(1).describe("The ID of the test suite."),
+      testCaseId: z.string().optional().describe("Filter to the points of a single test case, given as the test case work item id."),
+      includePointDetails: z.boolean().default(false).describe("Return the raw Azure DevOps test point objects instead of the compact rows. Defaults to false."),
+      continuationToken: z.string().optional().describe("Token to continue fetching test points from a previous request."),
+    },
+    async ({ project, planid, suiteid, testCaseId, includePointDetails, continuationToken }) => {
+      try {
+        const connection = await connectionProvider();
+        const accessToken = await tokenProvider();
+        const params = new URLSearchParams({ "api-version": "7.2-preview.2" });
+        if (testCaseId) params.append("testCaseId", testCaseId);
+        if (includePointDetails) params.append("includePointDetails", "true");
+        if (continuationToken) params.append("continuationToken", continuationToken);
+        const url = `${connection.serverUrl}/${encodeURIComponent(project)}/_apis/testplan/Plans/${planid}/Suites/${suiteid}/TestPoint?${params.toString()}`;
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${accessToken}`,
+        };
+
+        const userAgent = userAgentProvider?.();
+        if (userAgent) {
+          headers["User-Agent"] = userAgent;
+        }
+
+        const response = await fetch(url, {
+          method: "GET",
+          headers,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Failed to list test points (${response.status}): ${errorText}`);
+        }
+
+        const body = await response.json();
+        const points = body.value ?? [];
+        const nextToken = response.headers.get("x-ms-continuationtoken") ?? undefined;
+
+        const result: {
+          planId: number;
+          suiteId: number;
+          summary: { total: number; byOutcome: Record<string, number> };
+          testPoints: unknown[];
+          continuationToken?: string;
+        } = {
+          planId: planid,
+          suiteId: suiteid,
+          summary: summariseTestPointOutcomes(points),
+          testPoints: includePointDetails ? points : points.map(compactTestPoint),
+        };
+        if (nextToken) {
+          result.continuationToken = nextToken;
+        }
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error listing test points: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
     Test_Plan_Tools.test_results_from_build_id,
     "Gets a list of test results for a given project and build ID. Can filter by test outcome (e.g. Failed, Passed, Aborted). Returns test case titles, error messages, stack traces, and outcomes. Efficiently handles builds with large numbers of test runs.",
     {
@@ -696,6 +769,53 @@ function escapeXml(unsafe: string): string {
         return c;
     }
   });
+}
+
+const NOT_RUN_OUTCOME = "Active";
+const NOT_RUN_RAW_OUTCOMES = new Set(["unspecified", "none", ""]);
+
+// Azure DevOps reports the outcome of a point that has never been run as "unspecified" (and
+// occasionally omits it). The test plan UI calls that state Active, so report it under that name
+// rather than leaving a blank that reads as a missing value.
+function normaliseTestPointOutcome(rawOutcome: unknown): string {
+  if (typeof rawOutcome !== "string") {
+    return NOT_RUN_OUTCOME;
+  }
+
+  const outcome = rawOutcome.trim();
+  if (NOT_RUN_RAW_OUTCOMES.has(outcome.toLowerCase())) {
+    return NOT_RUN_OUTCOME;
+  }
+
+  return outcome.charAt(0).toUpperCase() + outcome.slice(1);
+}
+
+function compactTestPoint(point: any) {
+  const testCase = point?.testCaseReference ?? point?.testCase;
+  const results = point?.results;
+
+  return {
+    id: point?.id,
+    testCaseId: testCase?.id,
+    testCaseName: testCase?.name,
+    outcome: normaliseTestPointOutcome(results?.outcome),
+    lastResultState: results?.lastResultState,
+    tester: point?.tester?.displayName,
+    configuration: point?.configuration?.name,
+    isAutomated: point?.isAutomated,
+    lastUpdatedDate: results?.lastResultDetails?.dateCompleted ?? point?.lastUpdatedDate,
+  };
+}
+
+function summariseTestPointOutcomes(points: any[]): { total: number; byOutcome: Record<string, number> } {
+  const byOutcome: Record<string, number> = {};
+
+  for (const point of points) {
+    const outcome = normaliseTestPointOutcome(point?.results?.outcome);
+    byOutcome[outcome] = (byOutcome[outcome] ?? 0) + 1;
+  }
+
+  return { total: points.length, byOutcome };
 }
 
 export { Test_Plan_Tools, configureTestPlanTools };

@@ -53,6 +53,7 @@
 | Test Plans        | [mcp_ado_testplan_add_test_cases_to_suite](#mcp_ado_testplan_add_test_cases_to_suite)                     | Add test cases to a test suite                                    |
 | Test Plans        | [mcp_ado_testplan_remove_test_cases_from_suite](#mcp_ado_testplan_remove_test_cases_from_suite)           | Remove test cases from a test suite                               |
 | Test Plans        | [mcp_ado_testplan_list_test_cases](#mcp_ado_testplan_list_test_cases)                                     | List test cases in a test suite                                   |
+| Test Plans        | [mcp_ado_testplan_list_test_points](#mcp_ado_testplan_list_test_points)                                   | Read execution outcome per test point in a suite                  |
 | Test Plans        | [mcp_ado_testplan_create_test_case](#mcp_ado_testplan_create_test_case)                                   | Create a new test case work item                                  |
 | Test Plans        | [mcp_ado_testplan_update_test_case_steps](#mcp_ado_testplan_update_test_case_steps)                       | Update steps of an existing test case                             |
 | Test Plans        | [mcp_ado_testplan_show_test_results_from_build_id](#mcp_ado_testplan_show_test_results_from_build_id)     | Get test results for a specific build                             |
@@ -472,6 +473,13 @@ Gets a list of test cases in the test plan.
 
 - **Required**: `project`, `planid`, `suiteid`
 - **Optional**: `continuationToken`
+
+### mcp_ado_testplan_list_test_points
+
+Gets the test points of a test suite together with their execution outcome, so manual execution status can be read instead of tallied by hand. Returns one compact row per point (point id, test case id and name, outcome, tester, configuration, when it was last set) plus a count per outcome. A point that has never been run reports the outcome `Active`.
+
+- **Required**: `project`, `planid`, `suiteid`
+- **Optional**: `testCaseId`, `includePointDetails`, `continuationToken`
 
 ### mcp_ado_testplan_create_test_case
 
