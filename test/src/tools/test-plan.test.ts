@@ -695,36 +695,157 @@ describe("configureTestPlanTools", () => {
     it("reports a creation error per requirement and continues with the rest", async () => {
       const handler = getHandler();
       (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([
-        { id: 1, fields: { "System.Title": "A" } },
-        { id: 2, fields: { "System.Title": "B" } },
+        { id: 9209, fields: { "System.Title": "Aflys besøg" } },
+        { id: 9220, fields: { "System.Title": "Tilladelser i bero" } },
       ]);
-      (mockTestPlanApi.createTestSuite as jest.Mock).mockRejectedValueOnce(new Error("Suite already exists")).mockResolvedValueOnce({ id: 202, name: "2 : B" });
+      (mockTestPlanApi.createTestSuite as jest.Mock)
+        .mockRejectedValueOnce(new Error("TF400813: The user is not authorized to access this resource."))
+        .mockResolvedValueOnce({ id: 102, name: "9220 : Tilladelser i bero" });
 
-      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: "1,2" });
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: "9209,9220" });
 
       expect(result.isError).toBe(true);
       const body = JSON.parse(result.content[0].text);
-      expect(body.failed).toEqual([{ requirementId: 1, error: "Suite already exists" }]);
-      expect(body.created).toEqual([{ requirementId: 2, suiteId: 202, name: "2 : B" }]);
+      expect(body.failed).toEqual([{ requirementId: 9209, error: "TF400813: The user is not authorized to access this resource." }]);
+      expect(body.created).toEqual([{ requirementId: 9220, suiteId: 102, name: "9220 : Tilladelser i bero" }]);
     });
 
-    it("retries a suite creation that hits a concurrency conflict", async () => {
+    it("rejects ids with a non-numeric prefix such as '#9209' without calling the API", async () => {
       const handler = getHandler();
-      (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([{ id: 1, fields: { "System.Title": "A" } }]);
-      (mockTestPlanApi.createTestSuite as jest.Mock).mockRejectedValueOnce(new Error("TF26071: This work item has been changed by someone else")).mockResolvedValueOnce({ id: 301, name: "1 : A" });
 
-      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [1] });
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: ["#9209", "9220"] });
 
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("must be numeric work item ids, got: #9209");
+      expect(mockWitApi.getWorkItems).not.toHaveBeenCalled();
+    });
+
+    it("rejects ids outside the work item id range without calling the API", async () => {
+      const handler = getHandler();
+
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: ["0", "2147483648", "9220"] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("must be numeric work item ids, got: 0, 2147483648");
+      expect(mockWitApi.getWorkItems).not.toHaveBeenCalled();
+    });
+
+    it("rejects more than 200 requirement ids without calling the API", async () => {
+      const handler = getHandler();
+      const requirementIds = Array.from({ length: 201 }, (_, index) => 9000 + index);
+
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error creating requirement-based test suites: at most 200 requirement ids per call, got 201");
+      expect(mockWitApi.getWorkItems).not.toHaveBeenCalled();
+    });
+
+    it("shortens a suite name that would exceed the 255 character title limit", async () => {
+      const handler = getHandler();
+      const longTitle = "Frontend: ".padEnd(300, "x");
+      (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([{ id: 9242, fields: { "System.Title": longTitle } }]);
+      (mockTestPlanApi.createTestSuite as jest.Mock).mockResolvedValue({ id: 103, name: "shortened" });
+
+      await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9242] });
+
+      const [params] = (mockTestPlanApi.createTestSuite as jest.Mock).mock.calls[0] as [{ name: string }];
+      expect(params.name).toHaveLength(255);
+      expect(params.name.startsWith("9242 : Frontend: ")).toBe(true);
+    });
+
+    it("reports the suite name returned by the server", async () => {
+      const handler = getHandler();
+      (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([{ id: 9209, fields: { "System.Title": "Aflys besøg" } }]);
+      (mockTestPlanApi.createTestSuite as jest.Mock).mockResolvedValue({ id: 101, name: "9209 : Aflys besøg (1)" });
+
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9209] });
+
+      expect(JSON.parse(result.content[0].text).created).toEqual([{ requirementId: 9209, suiteId: 101, name: "9209 : Aflys besøg (1)" }]);
+    });
+
+    it("creates the suites one at a time, starting the next only when the previous has finished", async () => {
+      const handler = getHandler();
+      (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([
+        { id: 9209, fields: { "System.Title": "Aflys besøg" } },
+        { id: 9220, fields: { "System.Title": "Tilladelser i bero" } },
+      ]);
+      let resolveFirst: (suite: { id: number; name: string }) => void = () => undefined;
+      (mockTestPlanApi.createTestSuite as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveFirst = resolve;
+            })
+        )
+        .mockResolvedValueOnce({ id: 102, name: "9220 : Tilladelser i bero" });
+
+      const pending = handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9209, 9220] });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockTestPlanApi.createTestSuite).toHaveBeenCalledTimes(1);
+      resolveFirst({ id: 101, name: "9209 : Aflys besøg" });
+      await pending;
       expect(mockTestPlanApi.createTestSuite).toHaveBeenCalledTimes(2);
-      expect(result.isError).toBeUndefined();
-      expect(JSON.parse(result.content[0].text).created).toEqual([{ requirementId: 1, suiteId: 301, name: "1 : A" }]);
+    });
+
+    describe("concurrency conflicts", () => {
+      const conflict = () => new Error("TF26071: This work item has been changed by someone else since you opened it.");
+
+      // Drives the handler's backoff delays with fake timers until the call settles.
+      async function settleWithFakeTimers<T>(promise: Promise<T>): Promise<T> {
+        let settled = false;
+        const tracked = promise.finally(() => {
+          settled = true;
+        });
+        for (let step = 0; step < 20 && !settled; step++) {
+          await jest.advanceTimersByTimeAsync(20000);
+        }
+        return tracked;
+      }
+
+      beforeEach(() => {
+        jest.useFakeTimers();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+      });
+
+      it("retries a suite creation that hits a concurrency conflict", async () => {
+        const handler = getHandler();
+        (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([{ id: 9209, fields: { "System.Title": "Aflys besøg" } }]);
+        (mockTestPlanApi.createTestSuite as jest.Mock).mockRejectedValueOnce(conflict()).mockResolvedValueOnce({ id: 101, name: "9209 : Aflys besøg" });
+
+        const result = await settleWithFakeTimers(handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9209] }));
+
+        expect(mockTestPlanApi.createTestSuite).toHaveBeenCalledTimes(2);
+        expect(result.isError).toBeUndefined();
+        expect(JSON.parse(result.content[0].text).created).toEqual([{ requirementId: 9209, suiteId: 101, name: "9209 : Aflys besøg" }]);
+      });
+
+      it("gives up after five concurrency retries and reports the requirement as failed", async () => {
+        const handler = getHandler();
+        (mockWitApi.getWorkItems as jest.Mock).mockResolvedValue([{ id: 9209, fields: { "System.Title": "Aflys besøg" } }]);
+        (mockTestPlanApi.createTestSuite as jest.Mock).mockImplementation(() => Promise.reject(conflict()));
+
+        const result = await settleWithFakeTimers(handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9209] }));
+
+        expect(mockTestPlanApi.createTestSuite).toHaveBeenCalledTimes(6);
+        expect(result.isError).toBe(true);
+        const body = JSON.parse(result.content[0].text);
+        expect(body.created).toEqual([]);
+        expect(body.failed).toHaveLength(1);
+        expect(body.failed[0].requirementId).toBe(9209);
+        expect(body.failed[0].error.startsWith("TF26071")).toBe(true);
+      });
     });
 
     it("returns an error when the work item lookup fails", async () => {
       const handler = getHandler();
       (mockWitApi.getWorkItems as jest.Mock).mockRejectedValue(new Error("Unauthorized"));
 
-      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [1] });
+      const result = await handler({ project: "proj1", planId: 1, parentSuiteId: 5, requirementIds: [9209] });
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toBe("Error creating requirement-based test suites: Unauthorized");

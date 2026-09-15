@@ -9,6 +9,8 @@ import { z } from "zod";
 import { apiVersion } from "../utils.js";
 
 const concurrencyRetry = { maxRetries: 5, baseDelayMs: 500 };
+// getWorkItems accepts at most 200 ids per request; work item ids are int32; titles are limited to 255 characters.
+const requirementSuiteLimits = { maxRequirementIds: 200, maxWorkItemId: 2147483647, maxSuiteNameLength: 255 };
 
 // Retries an operation that failed on a test suite concurrency conflict (TF26071), with exponential backoff and jitter.
 async function withConcurrencyRetry<T>(operation: () => Promise<T>): Promise<T> {
@@ -208,7 +210,7 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
 
   server.tool(
     Test_Plan_Tools.create_requirement_suites,
-    "Creates requirement-based test suites in a test plan, one per requirement work item (for example a user story or bug). Each suite is linked to its requirement, so test cases added to it get a Tested By link to the requirement. Suites are named '<id> : <title>', the way the Azure DevOps web portal names them. Creation continues past individual failures and reports created and failed requirements separately.",
+    "Creates requirement-based test suites in a test plan, one per requirement work item (for example a user story or bug). Each suite is linked to its requirement, so test cases added to it get a Tested By link to the requirement. Suites are named '<id> : <title>', the way the Azure DevOps web portal names them. At most 200 requirement ids per call. Creation continues past individual failures and reports created and failed requirements separately; the response is marked as an error if anything failed, but the suites listed under 'created' exist, so only the ids under 'failed' should be retried.",
     {
       project: z.string().describe("Project ID or project name"),
       planId: z.coerce.number().min(1).describe("ID of the test plan that contains the suites"),
@@ -226,7 +228,7 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
           isError: true,
         };
       }
-      const invalidIds = rawIds.filter((id) => !/^\d+$/.test(id));
+      const invalidIds = rawIds.filter((id) => !/^\d+$/.test(id) || Number(id) < 1 || Number(id) > requirementSuiteLimits.maxWorkItemId);
       if (invalidIds.length > 0) {
         return {
           content: [{ type: "text", text: `Error creating requirement-based test suites: requirementIds must be numeric work item ids, got: ${invalidIds.join(", ")}` }],
@@ -234,6 +236,17 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         };
       }
       const ids = [...new Set(rawIds.map((id) => Number(id)))];
+      if (ids.length > requirementSuiteLimits.maxRequirementIds) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error creating requirement-based test suites: at most ${requirementSuiteLimits.maxRequirementIds} requirement ids per call, got ${ids.length}`,
+            },
+          ],
+          isError: true,
+        };
+      }
 
       try {
         const connection = await connectionProvider();
@@ -264,7 +277,8 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
             const suite = await withConcurrencyRetry(() =>
               testPlanApi.createTestSuite(
                 {
-                  name: `${requirementId} : ${title}`,
+                  // A long title would push the name past the work item title limit and fail the creation.
+                  name: `${requirementId} : ${title}`.slice(0, requirementSuiteLimits.maxSuiteNameLength),
                   parentSuite: { id: parentSuiteId, name: "" },
                   suiteType: TestSuiteType.RequirementTestSuite,
                   requirementId,
