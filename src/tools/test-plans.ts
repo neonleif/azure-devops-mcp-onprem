@@ -3,9 +3,29 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
-import { TestPlanCreateParams } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
+import { TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
+import { WorkItemErrorPolicy } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
 import { z } from "zod";
 import { apiVersion } from "../utils.js";
+
+const concurrencyRetry = { maxRetries: 5, baseDelayMs: 500 };
+
+// Retries an operation that failed on a test suite concurrency conflict (TF26071), with exponential backoff and jitter.
+async function withConcurrencyRetry<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "";
+      const isConcurrencyError = errorMessage.includes("TF26071") || errorMessage.includes("got update") || errorMessage.includes("changed by someone else");
+      if (!isConcurrencyError || attempt >= concurrencyRetry.maxRetries) {
+        throw error;
+      }
+      const delay = concurrencyRetry.baseDelayMs * Math.pow(2, attempt) + Math.random() * 200;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
 
 const Test_Plan_Tools = {
   create_test_plan: "testplan_create_test_plan",
@@ -19,6 +39,7 @@ const Test_Plan_Tools = {
   list_test_plans: "testplan_list_test_plans",
   list_test_suites: "testplan_list_test_suites",
   create_test_suite: "testplan_create_test_suite",
+  create_requirement_suites: "testplan_create_requirement_suites",
 };
 
 function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider?: () => string) {
@@ -182,6 +203,93 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         content: [{ type: "text", text: "Error creating test suite: Maximum retries exceeded" }],
         isError: true,
       };
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.create_requirement_suites,
+    "Creates requirement-based test suites in a test plan, one per requirement work item (for example a user story or bug). Each suite is linked to its requirement, so test cases added to it get a Tested By link to the requirement. Suites are named '<id> : <title>', the way the Azure DevOps web portal names them. Creation continues past individual failures and reports created and failed requirements separately.",
+    {
+      project: z.string().describe("Project ID or project name"),
+      planId: z.coerce.number().min(1).describe("ID of the test plan that contains the suites"),
+      parentSuiteId: z.coerce.number().min(1).describe("ID of the static suite under which the requirement-based suites will be created, for example the root suite of the plan"),
+      requirementIds: z
+        .string()
+        .or(z.array(z.string().or(z.number())))
+        .describe("The ID(s) of the requirement work item(s). Comma-separated string, or an array of ids (strings or numbers). One suite is created per id."),
+    },
+    async ({ project, planId, parentSuiteId, requirementIds }) => {
+      const rawIds = (Array.isArray(requirementIds) ? requirementIds : requirementIds.split(",")).map((id) => String(id).trim()).filter((id) => id.length > 0);
+      if (rawIds.length === 0) {
+        return {
+          content: [{ type: "text", text: "Error creating requirement-based test suites: requirementIds must contain at least one work item id" }],
+          isError: true,
+        };
+      }
+      const invalidIds = rawIds.filter((id) => !/^\d+$/.test(id));
+      if (invalidIds.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error creating requirement-based test suites: requirementIds must be numeric work item ids, got: ${invalidIds.join(", ")}` }],
+          isError: true,
+        };
+      }
+      const ids = [...new Set(rawIds.map((id) => Number(id)))];
+
+      try {
+        const connection = await connectionProvider();
+        const witClient = await connection.getWorkItemTrackingApi();
+        const testPlanApi = await connection.getTestPlanApi();
+
+        // Titles are read up front so each suite gets the portal's '<id> : <title>' name, and so an
+        // unknown id is reported per requirement instead of failing the whole batch.
+        const workItems = await witClient.getWorkItems(ids, ["System.Title"], undefined, undefined, WorkItemErrorPolicy.Omit);
+        const titles = new Map<number, string>();
+        for (const workItem of workItems ?? []) {
+          if (workItem?.id !== undefined) {
+            titles.set(workItem.id, String(workItem.fields?.["System.Title"] ?? ""));
+          }
+        }
+
+        const created: { requirementId: number; suiteId?: number; name?: string }[] = [];
+        const failed: { requirementId: number; error: string }[] = [];
+
+        // Sequential on purpose: parallel creation under the same parent suite triggers TF26071 conflicts.
+        for (const requirementId of ids) {
+          const title = titles.get(requirementId);
+          if (title === undefined) {
+            failed.push({ requirementId, error: "Work item not found or not accessible" });
+            continue;
+          }
+          try {
+            const suite = await withConcurrencyRetry(() =>
+              testPlanApi.createTestSuite(
+                {
+                  name: `${requirementId} : ${title}`,
+                  parentSuite: { id: parentSuiteId, name: "" },
+                  suiteType: TestSuiteType.RequirementTestSuite,
+                  requirementId,
+                },
+                project,
+                planId
+              )
+            );
+            created.push({ requirementId, suiteId: suite?.id, name: suite?.name });
+          } catch (error) {
+            failed.push({ requirementId, error: error instanceof Error ? error.message : "Unknown error occurred" });
+          }
+        }
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ planId, parentSuiteId, created, failed }, null, 2) }],
+          ...(failed.length > 0 ? { isError: true } : {}),
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error creating requirement-based test suites: ${errorMessage}` }],
+          isError: true,
+        };
+      }
     }
   );
 

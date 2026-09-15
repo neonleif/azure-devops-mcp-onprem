@@ -50,6 +50,7 @@
 | Test Plans        | [mcp_ado_testplan_create_test_plan](#mcp_ado_testplan_create_test_plan)                                   | Create a new test plan                                            |
 | Test Plans        | [mcp_ado_testplan_list_test_suites](#mcp_ado_testplan_list_test_suites)                                   | List test suites in a test plan                                   |
 | Test Plans        | [mcp_ado_testplan_create_test_suite](#mcp_ado_testplan_create_test_suite)                                 | Create a test suite within a test plan                            |
+| Test Plans        | [mcp_ado_testplan_create_requirement_suites](#mcp_ado_testplan_create_requirement_suites)                 | Create requirement-based test suites, one per requirement         |
 | Test Plans        | [mcp_ado_testplan_add_test_cases_to_suite](#mcp_ado_testplan_add_test_cases_to_suite)                     | Add test cases to a test suite                                    |
 | Test Plans        | [mcp_ado_testplan_remove_test_cases_from_suite](#mcp_ado_testplan_remove_test_cases_from_suite)           | Remove test cases from a test suite                               |
 | Test Plans        | [mcp_ado_testplan_list_test_cases](#mcp_ado_testplan_list_test_cases)                                     | List test cases in a test suite                                   |
@@ -451,6 +452,13 @@ Retrieve a paginated list of test suites from an Azure DevOps project and Test P
 Creates a new test suite in a test plan.
 
 - **Required**: `project`, `planId`, `parentSuiteId`, `name`
+- **Optional**: None
+
+### mcp_ado_testplan_create_requirement_suites
+
+Creates requirement-based test suites under a parent suite, one per requirement work item (for example a user story or bug). Each suite is linked to its requirement, so test cases added to it get a Tested By link to the requirement. Suites are named `<id> : <title>`, the way the web portal names them. `requirementIds` accepts a comma-separated string or an array of IDs; empty and non-numeric lists are rejected before any API call, and duplicates are ignored. Suites are created one at a time with retry on concurrency conflicts (TF26071). An unknown work item or a failed creation is reported per requirement without stopping the rest; the response lists `created` and `failed`, and is marked as an error if anything failed.
+
+- **Required**: `project`, `planId`, `parentSuiteId`, `requirementIds`
 - **Optional**: None
 
 ### mcp_ado_testplan_add_test_cases_to_suite
