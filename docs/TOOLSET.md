@@ -492,7 +492,7 @@ Gets a list of test cases in the test plan.
 
 ### mcp_ado_testplan_list_test_points
 
-Gets the test points of a test suite together with their execution outcome, so manual execution status can be read instead of tallied by hand. Returns one compact row per point (point id, test case id and name, outcome, tester, configuration, when it was last set) plus a count per outcome. A point that has never been run reports the outcome `Active`.
+Gets the test points of a test suite together with their execution outcome, so manual execution status can be read instead of tallied by hand. Returns one compact row per point (point id, test case id and name, outcome, tester, configuration, when it was last set) plus a count per outcome. A point that has never been run reports the outcome `Active`. The counts cover the returned page; `summary.complete` is false when a `continuationToken` is returned and more points remain.
 
 - **Required**: `project`, `planid`, `suiteid`
 - **Optional**: `testCaseId`, `includePointDetails`, `continuationToken`

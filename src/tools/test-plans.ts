@@ -717,13 +717,14 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const result: {
           planId: number;
           suiteId: number;
-          summary: { total: number; byOutcome: Record<string, number> };
+          summary: { total: number; byOutcome: Record<string, number>; complete: boolean };
           testPoints: unknown[];
           continuationToken?: string;
         } = {
           planId: planid,
           suiteId: suiteid,
-          summary: summariseTestPointOutcomes(points),
+          // The counts cover this page only; complete is false while more pages remain.
+          summary: { ...summariseTestPointOutcomes(points), complete: !nextToken },
           testPoints: includePointDetails ? points : points.map(compactTestPoint),
         };
         if (nextToken) {
@@ -1000,6 +1001,15 @@ function normaliseTestPointOutcome(rawOutcome: unknown): string {
   return outcome.charAt(0).toUpperCase() + outcome.slice(1);
 }
 
+// Azure DevOps fills a date that was never set with .NET's DateTime.MinValue, so a point that has never
+// been run reports dateCompleted as "0001-01-01T00:00:00". Treat that as missing so the fallback is used.
+function knownDate(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.startsWith("0001-01-01")) {
+    return undefined;
+  }
+  return value;
+}
+
 function compactTestPoint(point: any) {
   const testCase = point?.testCaseReference ?? point?.testCase;
   const results = point?.results;
@@ -1013,7 +1023,7 @@ function compactTestPoint(point: any) {
     tester: point?.tester?.displayName,
     configuration: point?.configuration?.name,
     isAutomated: point?.isAutomated,
-    lastUpdatedDate: results?.lastResultDetails?.dateCompleted ?? point?.lastUpdatedDate,
+    lastUpdatedDate: knownDate(results?.lastResultDetails?.dateCompleted) ?? knownDate(point?.lastUpdatedDate),
   };
 }
 

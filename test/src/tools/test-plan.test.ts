@@ -997,7 +997,7 @@ describe("configureTestPlanTools", () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.planId).toBe(9105);
       expect(parsed.suiteId).toBe(9241);
-      expect(parsed.summary).toEqual({ total: 2, byOutcome: { Passed: 1, Active: 1 } });
+      expect(parsed.summary).toEqual({ total: 2, byOutcome: { Passed: 1, Active: 1 }, complete: true });
       expect(parsed.testPoints).toEqual([
         {
           id: 279,
@@ -1022,6 +1022,53 @@ describe("configureTestPlanTools", () => {
           lastUpdatedDate: undefined,
         },
       ]);
+    });
+
+    it("counts multiple points with the same outcome", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint, { ...passedPoint, id: 281 }, neverRunPoint]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      expect(JSON.parse(result.content[0].text).summary).toEqual({ total: 3, byOutcome: { Passed: 2, Active: 1 }, complete: true });
+    });
+
+    it("marks the summary incomplete when more pages remain", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint], "next-page");
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.continuationToken).toBe("next-page");
+      expect(parsed.summary.complete).toBe(false);
+    });
+
+    it("ignores the DateTime.MinValue completion date of a never-run point and falls back to lastUpdatedDate", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([
+        {
+          ...neverRunPoint,
+          lastUpdatedDate: "2026-09-15T11:40:19.547Z",
+          results: { outcome: "unspecified", lastResultDetails: { dateCompleted: "0001-01-01T00:00:00" } },
+        },
+        { ...neverRunPoint, id: 282, results: { outcome: "unspecified", lastResultDetails: { dateCompleted: "0001-01-01T00:00:00" } } },
+      ]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.testPoints[0].lastUpdatedDate).toBe("2026-09-15T11:40:19.547Z");
+      expect(parsed.testPoints[1].lastUpdatedDate).toBeUndefined();
+    });
+
+    it("keeps the casing of a camelCase multi-word outcome", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([{ ...passedPoint, results: { outcome: "notExecuted" } }]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      expect(JSON.parse(result.content[0].text).testPoints[0].outcome).toBe("NotExecuted");
     });
 
     it("reports a missing outcome as Active", async () => {
