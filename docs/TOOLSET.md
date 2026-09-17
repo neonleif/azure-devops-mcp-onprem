@@ -53,6 +53,7 @@
 | Test Plans        | [mcp_ado_testplan_create_requirement_suites](#mcp_ado_testplan_create_requirement_suites)                 | Create requirement-based test suites, one per requirement         |
 | Test Plans        | [mcp_ado_testplan_add_test_cases_to_suite](#mcp_ado_testplan_add_test_cases_to_suite)                     | Add test cases to a test suite                                    |
 | Test Plans        | [mcp_ado_testplan_remove_test_cases_from_suite](#mcp_ado_testplan_remove_test_cases_from_suite)           | Remove test cases from a test suite                               |
+| Test Plans        | [mcp_ado_testplan_reorder_suite_entries](#mcp_ado_testplan_reorder_suite_entries)                         | Set the order of test cases and child suites in a suite           |
 | Test Plans        | [mcp_ado_testplan_list_test_cases](#mcp_ado_testplan_list_test_cases)                                     | List test cases in a test suite                                   |
 | Test Plans        | [mcp_ado_testplan_list_test_points](#mcp_ado_testplan_list_test_points)                                   | Read execution outcome per test point in a suite                  |
 | Test Plans        | [mcp_ado_testplan_create_test_case](#mcp_ado_testplan_create_test_case)                                   | Create a new test case work item                                  |
@@ -473,6 +474,13 @@ Adds existing test cases to a test suite.
 Removes test cases from a test suite. Only the suite membership is removed; the test case work items themselves are not deleted and stay in any other suites they belong to. `testCaseIds` accepts a comma-separated string or an array of IDs; an empty list is rejected before any API call.
 
 - **Required**: `project`, `planId`, `suiteId`, `testCaseIds`
+- **Optional**: None
+
+### mcp_ado_testplan_reorder_suite_entries
+
+Sets the order of test cases and child suites in a test suite, so a suite can be run top to bottom in a planned order without dragging entries in the UI. List the entries in the order they should appear; entries left out keep their current relative order and are placed after the listed ones. Ids that are not in the suite and duplicate entries are rejected before anything is changed.
+
+- **Required**: `project`, `suiteId`, `orderedEntries` (array of `{ id, entryType }`, where `entryType` is `testCase` or `suite` and defaults to `testCase`)
 - **Optional**: None
 
 ### mcp_ado_testplan_list_test_cases

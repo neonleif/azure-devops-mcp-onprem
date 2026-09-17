@@ -42,6 +42,8 @@ describe("configureTestPlanTools", () => {
       createTestSuite: jest.fn(),
       addTestCasesToSuite: jest.fn(),
       getTestCaseList: jest.fn(),
+      getSuiteEntries: jest.fn(),
+      reorderSuiteEntries: jest.fn(),
     } as unknown as ITestPlanApi;
     mockTestResultsApi = {
       getTestResultDetailsForBuild: jest.fn(),
@@ -78,6 +80,7 @@ describe("configureTestPlanTools", () => {
           "testplan_create_requirement_suites",
           "testplan_add_test_cases_to_suite",
           "testplan_remove_test_cases_from_suite",
+          "testplan_reorder_suite_entries",
           "testplan_create_test_case",
           "testplan_update_test_case_steps",
           "testplan_list_test_cases",
@@ -2918,6 +2921,188 @@ describe("configureTestPlanTools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Error adding test cases to suite");
       expect(result.content[0].text).toContain("API Error");
+    });
+  });
+
+  describe("reorder_suite_entries tool", () => {
+    function getHandler() {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_reorder_suite_entries");
+      if (!call) throw new Error("testplan_reorder_suite_entries tool not registered");
+      const [, , schema, handler] = call;
+      return { schema, handler };
+    }
+
+    const currentEntries = [
+      { id: 101, sequenceNumber: 0, suiteEntryType: 0, suiteId: 5 },
+      { id: 102, sequenceNumber: 1, suiteEntryType: 0, suiteId: 5 },
+      { id: 103, sequenceNumber: 2, suiteEntryType: 0, suiteId: 5 },
+      { id: 900, sequenceNumber: 3, suiteEntryType: 1, suiteId: 5 },
+    ];
+
+    it("sends the listed entries first and keeps unlisted entries after them in their current order", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue(currentEntries);
+      (mockTestPlanApi.reorderSuiteEntries as jest.Mock).mockImplementation(async (updates: unknown) => updates);
+
+      const result = await handler({
+        project: "proj1",
+        suiteId: 5,
+        orderedEntries: [
+          { id: 103, entryType: "testCase" },
+          { id: 900, entryType: "suite" },
+        ],
+      });
+
+      expect(mockTestPlanApi.getSuiteEntries).toHaveBeenCalledWith("proj1", 5);
+      expect(mockTestPlanApi.reorderSuiteEntries).toHaveBeenCalledWith(
+        [
+          { id: 103, sequenceNumber: 0, suiteEntryType: 0 },
+          { id: 900, sequenceNumber: 1, suiteEntryType: 1 },
+          { id: 101, sequenceNumber: 2, suiteEntryType: 0 },
+          { id: 102, sequenceNumber: 3, suiteEntryType: 0 },
+        ],
+        "proj1",
+        5
+      );
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        suiteId: 5,
+        entries: [
+          { id: 103, entryType: "testCase", sequenceNumber: 0 },
+          { id: 900, entryType: "suite", sequenceNumber: 1 },
+          { id: 101, entryType: "testCase", sequenceNumber: 2 },
+          { id: 102, entryType: "testCase", sequenceNumber: 3 },
+        ],
+      });
+    });
+
+    it("defaults entryType to testCase at the schema boundary and accepts string ids", () => {
+      const { schema } = getHandler();
+      const parsed = z.object(schema).safeParse({ project: "proj1", suiteId: "5", orderedEntries: [{ id: "101" }] });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data.orderedEntries).toEqual([{ id: 101, entryType: "testCase" }]);
+      }
+      expect(z.object(schema).safeParse({ project: "proj1", suiteId: 5, orderedEntries: [] }).success).toBe(false);
+    });
+
+    it("rejects ids that are not in the suite without reordering", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue(currentEntries);
+
+      const result = await handler({
+        project: "proj1",
+        suiteId: 5,
+        orderedEntries: [
+          { id: 101, entryType: "testCase" },
+          { id: 555, entryType: "testCase" },
+        ],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not in suite 5: testCase:555");
+      expect(mockTestPlanApi.reorderSuiteEntries).not.toHaveBeenCalled();
+    });
+
+    it("treats a test case id and a suite id as different entries", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue(currentEntries);
+
+      const result = await handler({ project: "proj1", suiteId: 5, orderedEntries: [{ id: 900, entryType: "testCase" }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("testCase:900");
+      expect(mockTestPlanApi.reorderSuiteEntries).not.toHaveBeenCalled();
+    });
+
+    it("rejects duplicate entries before calling the API", async () => {
+      const { handler } = getHandler();
+
+      const result = await handler({
+        project: "proj1",
+        suiteId: 5,
+        orderedEntries: [
+          { id: 101, entryType: "testCase" },
+          { id: 101, entryType: "testCase" },
+        ],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("duplicate entries: testCase:101");
+      expect(mockTestPlanApi.getSuiteEntries).not.toHaveBeenCalled();
+      expect(mockTestPlanApi.reorderSuiteEntries).not.toHaveBeenCalled();
+    });
+
+    it("allows the same numeric id for a test case and a child suite in the same call", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue([
+        { id: 101, sequenceNumber: 0, suiteEntryType: 0, suiteId: 5 },
+        { id: 101, sequenceNumber: 1, suiteEntryType: 1, suiteId: 5 },
+      ]);
+      (mockTestPlanApi.reorderSuiteEntries as jest.Mock).mockImplementation(async (updates: unknown) => updates);
+
+      const result = await handler({
+        project: "proj1",
+        suiteId: 5,
+        orderedEntries: [
+          { id: 101, entryType: "suite" },
+          { id: 101, entryType: "testCase" },
+        ],
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestPlanApi.reorderSuiteEntries).toHaveBeenCalledWith(
+        [
+          { id: 101, sequenceNumber: 0, suiteEntryType: 1 },
+          { id: 101, sequenceNumber: 1, suiteEntryType: 0 },
+        ],
+        "proj1",
+        5
+      );
+    });
+
+    it("rereads the suite on a concurrency conflict instead of resending the stale order", async () => {
+      jest.useFakeTimers();
+      try {
+        const { handler } = getHandler();
+        const afterConflict = [...currentEntries, { id: 104, sequenceNumber: 4, suiteEntryType: 0, suiteId: 5 }];
+        (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValueOnce(currentEntries).mockResolvedValueOnce(afterConflict);
+        (mockTestPlanApi.reorderSuiteEntries as jest.Mock)
+          .mockRejectedValueOnce(new Error("TF26071: This work item has been changed by someone else since you opened it."))
+          .mockImplementationOnce(async (updates: unknown) => updates);
+
+        const pending = handler({ project: "proj1", suiteId: 5, orderedEntries: [{ id: 103, entryType: "testCase" }] });
+        await jest.advanceTimersByTimeAsync(20000);
+        const result = await pending;
+
+        expect(result.isError).toBeUndefined();
+        expect(mockTestPlanApi.getSuiteEntries).toHaveBeenCalledTimes(2);
+        expect(mockTestPlanApi.reorderSuiteEntries).toHaveBeenLastCalledWith(
+          [
+            { id: 103, sequenceNumber: 0, suiteEntryType: 0 },
+            { id: 101, sequenceNumber: 1, suiteEntryType: 0 },
+            { id: 102, sequenceNumber: 2, suiteEntryType: 0 },
+            { id: 900, sequenceNumber: 3, suiteEntryType: 1 },
+            { id: 104, sequenceNumber: 4, suiteEntryType: 0 },
+          ],
+          "proj1",
+          5
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("returns an error when the API call fails", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue(currentEntries);
+      (mockTestPlanApi.reorderSuiteEntries as jest.Mock).mockRejectedValue(new Error("API Error"));
+
+      const result = await handler({ project: "proj1", suiteId: 5, orderedEntries: [{ id: 102, entryType: "testCase" }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error reordering suite entries: API Error");
     });
   });
 
