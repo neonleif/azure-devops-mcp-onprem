@@ -3,7 +3,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
-import { TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
+import { SuiteEntryTypes, SuiteEntryUpdateParams, TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
 import { WorkItemErrorPolicy } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
 import { z } from "zod";
 import { apiVersion } from "../utils.js";
@@ -35,6 +35,7 @@ const Test_Plan_Tools = {
   update_test_case_steps: "testplan_update_test_case_steps",
   add_test_cases_to_suite: "testplan_add_test_cases_to_suite",
   remove_test_cases_from_suite: "testplan_remove_test_cases_from_suite",
+  reorder_suite_entries: "testplan_reorder_suite_entries",
   test_results_from_build_id: "testplan_show_test_results_from_build_id",
   list_test_cases: "testplan_list_test_cases",
   list_test_points: "testplan_list_test_points",
@@ -377,6 +378,83 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
         return {
           content: [{ type: "text", text: `Error removing test cases from suite: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.reorder_suite_entries,
+    "Sets the order of test cases and child suites in a test suite. List the entries in the order they should appear; entries left out keep their current relative order and are placed after the listed ones.",
+    {
+      project: z.string().describe("The unique identifier (ID or name) of the Azure DevOps project."),
+      suiteId: z.coerce.number().min(1).describe("The ID of the test suite whose entries are reordered."),
+      orderedEntries: z
+        .array(
+          z.object({
+            id: z.coerce.number().min(1).describe("The test case ID or child suite ID."),
+            entryType: z.enum(["testCase", "suite"]).default("testCase").describe("Whether the id is a test case or a child suite. Defaults to testCase."),
+          })
+        )
+        .min(1)
+        .describe("The entries in the order they should appear, first entry first."),
+    },
+    async ({ project, suiteId, orderedEntries }) => {
+      const toType = (entryType: "testCase" | "suite") => (entryType === "suite" ? SuiteEntryTypes.Suite : SuiteEntryTypes.TestCase);
+      const keyOf = (id: number, type: SuiteEntryTypes | undefined) => `${type === SuiteEntryTypes.Suite ? "suite" : "testCase"}:${id}`;
+
+      const requested = orderedEntries.map((entry) => ({ id: entry.id, type: toType(entry.entryType) }));
+      const requestedKeys = requested.map((entry) => keyOf(entry.id, entry.type));
+      const duplicates = [...new Set(requestedKeys.filter((key, index) => requestedKeys.indexOf(key) !== index))];
+      if (duplicates.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error reordering suite entries: duplicate entries: ${duplicates.join(", ")}` }],
+          isError: true,
+        };
+      }
+
+      try {
+        const connection = await connectionProvider();
+        const testPlanApi = await connection.getTestPlanApi();
+
+        // Sequence numbers are shared by every entry in the suite, so a partial list is completed with the
+        // current entries; otherwise an unlisted entry could keep a number that now collides with a listed one.
+        const currentEntries = await testPlanApi.getSuiteEntries(project, suiteId);
+        const currentKeys = new Set(currentEntries.map((entry) => keyOf(entry.id ?? 0, entry.suiteEntryType)));
+        const unknown = requestedKeys.filter((key) => !currentKeys.has(key));
+        if (unknown.length > 0) {
+          return {
+            content: [{ type: "text", text: `Error reordering suite entries: not in suite ${suiteId}: ${unknown.join(", ")}` }],
+            isError: true,
+          };
+        }
+
+        const requestedKeySet = new Set(requestedKeys);
+        const remaining = currentEntries
+          .filter((entry) => !requestedKeySet.has(keyOf(entry.id ?? 0, entry.suiteEntryType)))
+          .sort((a, b) => (a.sequenceNumber ?? 0) - (b.sequenceNumber ?? 0))
+          .map((entry) => ({ id: entry.id ?? 0, type: entry.suiteEntryType ?? SuiteEntryTypes.TestCase }));
+
+        const updates: SuiteEntryUpdateParams[] = [...requested, ...remaining].map((entry, index) => ({
+          id: entry.id,
+          sequenceNumber: index,
+          suiteEntryType: entry.type,
+        }));
+
+        const result = await withConcurrencyRetry(() => testPlanApi.reorderSuiteEntries(updates, project, suiteId));
+
+        const entries = [...(result ?? [])]
+          .sort((a, b) => (a.sequenceNumber ?? 0) - (b.sequenceNumber ?? 0))
+          .map((entry) => ({ id: entry.id, entryType: entry.suiteEntryType === SuiteEntryTypes.Suite ? "suite" : "testCase", sequenceNumber: entry.sequenceNumber }));
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ suiteId, entries }, null, 2) }],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error reordering suite entries: ${errorMessage}` }],
           isError: true,
         };
       }
