@@ -418,31 +418,41 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const connection = await connectionProvider();
         const testPlanApi = await connection.getTestPlanApi();
 
-        // Sequence numbers are shared by every entry in the suite, so a partial list is completed with the
-        // current entries; otherwise an unlisted entry could keep a number that now collides with a listed one.
-        const currentEntries = await testPlanApi.getSuiteEntries(project, suiteId);
-        const currentKeys = new Set(currentEntries.map((entry) => keyOf(entry.id ?? 0, entry.suiteEntryType)));
-        const unknown = requestedKeys.filter((key) => !currentKeys.has(key));
-        if (unknown.length > 0) {
+        const requestedKeySet = new Set(requestedKeys);
+
+        // The whole read-compute-write runs inside the retry: a concurrency conflict means the suite changed,
+        // so the order has to be rebuilt from a fresh read rather than resending the one computed before it.
+        const outcome = await withConcurrencyRetry(async () => {
+          // Sequence numbers are shared by every entry in the suite, so a partial list is completed with the
+          // current entries; otherwise an unlisted entry could keep a number that now collides with a listed one.
+          const currentEntries = await testPlanApi.getSuiteEntries(project, suiteId);
+          const currentKeys = new Set(currentEntries.map((entry) => keyOf(entry.id ?? 0, entry.suiteEntryType)));
+          const unknown = requestedKeys.filter((key) => !currentKeys.has(key));
+          if (unknown.length > 0) {
+            return { ok: false as const, unknown };
+          }
+
+          const remaining = currentEntries
+            .filter((entry) => !requestedKeySet.has(keyOf(entry.id ?? 0, entry.suiteEntryType)))
+            .sort((a, b) => (a.sequenceNumber ?? 0) - (b.sequenceNumber ?? 0))
+            .map((entry) => ({ id: entry.id ?? 0, type: entry.suiteEntryType ?? SuiteEntryTypes.TestCase }));
+
+          const updates: SuiteEntryUpdateParams[] = [...requested, ...remaining].map((entry, index) => ({
+            id: entry.id,
+            sequenceNumber: index,
+            suiteEntryType: entry.type,
+          }));
+
+          return { ok: true as const, result: await testPlanApi.reorderSuiteEntries(updates, project, suiteId) };
+        });
+
+        if (!outcome.ok) {
           return {
-            content: [{ type: "text", text: `Error reordering suite entries: not in suite ${suiteId}: ${unknown.join(", ")}` }],
+            content: [{ type: "text", text: `Error reordering suite entries: not in suite ${suiteId}: ${outcome.unknown.join(", ")}` }],
             isError: true,
           };
         }
-
-        const requestedKeySet = new Set(requestedKeys);
-        const remaining = currentEntries
-          .filter((entry) => !requestedKeySet.has(keyOf(entry.id ?? 0, entry.suiteEntryType)))
-          .sort((a, b) => (a.sequenceNumber ?? 0) - (b.sequenceNumber ?? 0))
-          .map((entry) => ({ id: entry.id ?? 0, type: entry.suiteEntryType ?? SuiteEntryTypes.TestCase }));
-
-        const updates: SuiteEntryUpdateParams[] = [...requested, ...remaining].map((entry, index) => ({
-          id: entry.id,
-          sequenceNumber: index,
-          suiteEntryType: entry.type,
-        }));
-
-        const result = await withConcurrencyRetry(() => testPlanApi.reorderSuiteEntries(updates, project, suiteId));
+        const result = outcome.result;
 
         const entries = [...(result ?? [])]
           .sort((a, b) => (a.sequenceNumber ?? 0) - (b.sequenceNumber ?? 0))

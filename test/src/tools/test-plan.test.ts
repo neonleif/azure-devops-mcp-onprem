@@ -3034,6 +3034,66 @@ describe("configureTestPlanTools", () => {
       expect(mockTestPlanApi.reorderSuiteEntries).not.toHaveBeenCalled();
     });
 
+    it("allows the same numeric id for a test case and a child suite in the same call", async () => {
+      const { handler } = getHandler();
+      (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue([
+        { id: 101, sequenceNumber: 0, suiteEntryType: 0, suiteId: 5 },
+        { id: 101, sequenceNumber: 1, suiteEntryType: 1, suiteId: 5 },
+      ]);
+      (mockTestPlanApi.reorderSuiteEntries as jest.Mock).mockImplementation(async (updates: unknown) => updates);
+
+      const result = await handler({
+        project: "proj1",
+        suiteId: 5,
+        orderedEntries: [
+          { id: 101, entryType: "suite" },
+          { id: 101, entryType: "testCase" },
+        ],
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestPlanApi.reorderSuiteEntries).toHaveBeenCalledWith(
+        [
+          { id: 101, sequenceNumber: 0, suiteEntryType: 1 },
+          { id: 101, sequenceNumber: 1, suiteEntryType: 0 },
+        ],
+        "proj1",
+        5
+      );
+    });
+
+    it("rereads the suite on a concurrency conflict instead of resending the stale order", async () => {
+      jest.useFakeTimers();
+      try {
+        const { handler } = getHandler();
+        const afterConflict = [...currentEntries, { id: 104, sequenceNumber: 4, suiteEntryType: 0, suiteId: 5 }];
+        (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValueOnce(currentEntries).mockResolvedValueOnce(afterConflict);
+        (mockTestPlanApi.reorderSuiteEntries as jest.Mock)
+          .mockRejectedValueOnce(new Error("TF26071: This work item has been changed by someone else since you opened it."))
+          .mockImplementationOnce(async (updates: unknown) => updates);
+
+        const pending = handler({ project: "proj1", suiteId: 5, orderedEntries: [{ id: 103, entryType: "testCase" }] });
+        await jest.advanceTimersByTimeAsync(20000);
+        const result = await pending;
+
+        expect(result.isError).toBeUndefined();
+        expect(mockTestPlanApi.getSuiteEntries).toHaveBeenCalledTimes(2);
+        expect(mockTestPlanApi.reorderSuiteEntries).toHaveBeenLastCalledWith(
+          [
+            { id: 103, sequenceNumber: 0, suiteEntryType: 0 },
+            { id: 101, sequenceNumber: 1, suiteEntryType: 0 },
+            { id: 102, sequenceNumber: 2, suiteEntryType: 0 },
+            { id: 900, sequenceNumber: 3, suiteEntryType: 1 },
+            { id: 104, sequenceNumber: 4, suiteEntryType: 0 },
+          ],
+          "proj1",
+          5
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it("returns an error when the API call fails", async () => {
       const { handler } = getHandler();
       (mockTestPlanApi.getSuiteEntries as jest.Mock).mockResolvedValue(currentEntries);

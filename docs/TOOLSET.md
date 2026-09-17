@@ -476,19 +476,19 @@ Removes test cases from a test suite. Only the suite membership is removed; the 
 - **Required**: `project`, `planId`, `suiteId`, `testCaseIds`
 - **Optional**: None
 
-### mcp_ado_testplan_list_test_cases
-
-Gets a list of test cases in the test plan.
-
-- **Required**: `project`, `planid`, `suiteid`
-- **Optional**: `continuationToken`
-
 ### mcp_ado_testplan_reorder_suite_entries
 
 Sets the order of test cases and child suites in a test suite, so a suite can be run top to bottom in a planned order without dragging entries in the UI. List the entries in the order they should appear; entries left out keep their current relative order and are placed after the listed ones. Ids that are not in the suite and duplicate entries are rejected before anything is changed.
 
 - **Required**: `project`, `suiteId`, `orderedEntries` (array of `{ id, entryType }`, where `entryType` is `testCase` or `suite` and defaults to `testCase`)
 - **Optional**: None
+
+### mcp_ado_testplan_list_test_cases
+
+Gets a list of test cases in the test plan.
+
+- **Required**: `project`, `planid`, `suiteid`
+- **Optional**: `continuationToken`
 
 ### mcp_ado_testplan_list_test_points
 
