@@ -11,8 +11,15 @@ import { IWorkItemTrackingApi } from "azure-devops-node-api/WorkItemTrackingApi"
 import { ITestApi } from "azure-devops-node-api/TestApi";
 import { z } from "zod";
 import { mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "fs";
+import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import { basename, join } from "path";
+
+// readFile passes through to the real one; single tests override it to simulate a file that changed after the check.
+jest.mock("fs/promises", () => {
+  const actual = jest.requireActual("fs/promises");
+  return { ...actual, readFile: jest.fn((...args: unknown[]) => actual.readFile(...args)) };
+});
 
 type TokenProviderMock = () => Promise<string>;
 type ConnectionProviderMock = () => Promise<WebApi>;
@@ -3339,6 +3346,8 @@ describe("configureTestPlanTools", () => {
       });
 
       expect(mockTestApi.createTestRun).toHaveBeenCalledWith({ name: "OPR agent run", plan: { id: "9927" }, pointIds: [11, 12], automated: false, configurationIds: [] }, "proj1");
+      // ResultDetails.Point: without it the point reference that maps results to points is not guaranteed.
+      expect(mockTestApi.getTestResults).toHaveBeenCalledWith("proj1", 77, 8, 0, 200);
       expect(mockTestApi.updateTestResults).toHaveBeenCalledWith(
         [
           { id: 100000, outcome: "Passed", state: "Completed", comment: undefined, completedDate: expect.any(Date) },
@@ -3504,6 +3513,86 @@ describe("configureTestPlanTools", () => {
       }
     });
 
+    it("rejects an empty run name and more than 200 results in the schema", () => {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_record_test_results");
+      const schema = z.object(call[2]);
+      const oneResult = [{ pointId: 11, outcome: "Passed" }];
+
+      expect(schema.safeParse({ project: "proj1", planId: 9927, results: oneResult }).success).toBe(true);
+      expect(schema.safeParse({ project: "proj1", planId: 9927, runName: "", results: oneResult }).success).toBe(false);
+      const tooMany = Array.from({ length: 201 }, (_, index) => ({ pointId: index + 1, outcome: "Passed" }));
+      expect(schema.safeParse({ project: "proj1", planId: 9927, results: tooMany }).success).toBe(false);
+    });
+
+    it("accepts a file whose name starts with two dots", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockResolvedValue({ id: 501 });
+      writeFileSync(join(fileDir, "..final.png"), "png-bytes");
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "..final.png" }] }] });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenCalledWith(expect.objectContaining({ fileName: "..final.png" }), "proj1", 77, 100000);
+    });
+
+    it("refuses a relative ADO_MCP_EVIDENCE_DIR", async () => {
+      const handler = getHandler();
+      process.env.ADO_MCP_EVIDENCE_DIR = "evidence";
+      try {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "shot.png" }] }] });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("ADO_MCP_EVIDENCE_DIR must be an absolute path, got 'evidence'");
+        expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      } finally {
+        process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
+      }
+    });
+
+    it("refuses a file that grew over the limit after it was checked, and keeps the result", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (fsPromises.readFile as unknown as jest.Mock).mockResolvedValueOnce(Buffer.alloc(25 * 1024 * 1024 + 1));
+      {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: recordingPath }] }] });
+
+        expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+        expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+        const body = JSON.parse(result.content[0].text);
+        expect(body.failed).toEqual([expect.objectContaining({ pointId: 11, step: "attachment", resultId: 100000, error: expect.stringContaining("grew to 26 MB") })]);
+      }
+    });
+
+    it("aborts the run when none of the points has a result in it", async () => {
+      const handler = getHandler();
+      mockRunWithResults([]);
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(mockTestApi.updateTestResults).not.toHaveBeenCalled();
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Aborted" }, "proj1", 77);
+      expect(mockTestApi.updateTestRun).not.toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("none of the test points has a result in the run");
+    });
+
+    it("keeps the recorded results when only completing the run fails", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.updateTestRun as jest.Mock).mockRejectedValue(new Error("TF400001"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledTimes(1);
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.recorded).toEqual([{ pointId: 11, resultId: 100000, outcome: "Passed", attachmentIds: [] }]);
+      expect(body.failed).toEqual([{ pointId: 0, step: "complete", error: "The results are saved, but the run could not be completed and may still be in progress: TF400001" }]);
+    });
+
     it("reports a point the run has no result for, records the others and completes the run", async () => {
       const handler = getHandler();
       mockRunWithResults([{ id: 100000, pointId: 11 }]);
@@ -3536,7 +3625,7 @@ describe("configureTestPlanTools", () => {
       expect(result.isError).toBe(true);
       const body = JSON.parse(result.content[0].text);
       expect(body.recorded).toEqual([{ pointId: 11, resultId: 100000, outcome: "Failed", attachmentIds: [] }]);
-      expect(body.failed).toEqual([{ pointId: 11, step: "attachment", filePath: recordingPath, error: "Request entity too large" }]);
+      expect(body.failed).toEqual([{ pointId: 11, step: "attachment", resultId: 100000, filePath: recordingPath, error: "Request entity too large" }]);
     });
 
     it("aborts the run when the results cannot be updated", async () => {
@@ -3550,7 +3639,7 @@ describe("configureTestPlanTools", () => {
       expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Aborted" }, "proj1", 77);
       expect(mockTestApi.updateTestRun).not.toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toBe("Error recording test results in test run 77 (the run was aborted): TF400898");
+      expect(result.content[0].text).toBe("Error recording test results in test run 77 (the run was aborted; read it with testplan_get_test_run_results to see what was saved): TF400898");
     });
 
     it("says so when the run could not be aborted either", async () => {
@@ -3619,6 +3708,20 @@ describe("configureTestPlanTools", () => {
           { resultId: 100001, pointId: 12, testCaseId: 9976, testCaseTitle: "OPR-2", outcome: "Failed", state: "Completed", comment: "409 in English", attachments: [] },
         ],
       });
+    });
+
+    it("pages through runs with more results than one page", async () => {
+      const handler = getHandler();
+      (mockTestApi.getTestRunById as jest.Mock).mockResolvedValue({ id: 77 });
+      const firstPage = Array.from({ length: 200 }, (_, index) => ({ id: index + 1, testPoint: { id: String(index + 1000) } }));
+      (mockTestApi.getTestResults as jest.Mock).mockResolvedValueOnce(firstPage).mockResolvedValueOnce([{ id: 201, testPoint: { id: "1200" } }]);
+      (mockTestApi.getTestResultAttachments as jest.Mock).mockResolvedValue([]);
+
+      const result = await handler({ project: "proj1", runId: 77 });
+
+      expect(mockTestApi.getTestResults).toHaveBeenNthCalledWith(1, "proj1", 77, 8, 0, 200);
+      expect(mockTestApi.getTestResults).toHaveBeenNthCalledWith(2, "proj1", 77, 8, 200, 200);
+      expect(JSON.parse(result.content[0].text).results).toHaveLength(201);
     });
 
     it("returns an error when the run cannot be read", async () => {
