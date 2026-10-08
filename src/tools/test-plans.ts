@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { readFile, stat } from "fs/promises";
-import { basename, extname } from "path";
+import { readFile, realpath, stat } from "fs/promises";
+import { homedir } from "os";
+import { basename, extname, isAbsolute, join, relative, resolve } from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
 import { SuiteEntryTypes, SuiteEntryUpdateParams, TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
@@ -923,7 +924,7 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
 
   server.tool(
     Test_Plan_Tools.record_test_results,
-    `Records the outcome of manually executed test points as one completed test run in a test plan. For each test point it sets the outcome and an optional comment, and attaches local files as evidence (screenshots or a short screen recording; png, jpg, gif, webm, mp4, txt or log, at most ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB each). Get the point ids from testplan_list_test_points. Input is validated before anything is created. The run is always completed, also when some results or attachments failed; the response is marked as an error if anything failed, but everything under 'recorded' exists, so only what is listed under 'failed' should be recorded again, in a new run. Read the run back with testplan_get_test_run_results.`,
+    `Records the outcome of manually executed test points as one completed test run in a test plan. For each test point it sets the outcome and an optional comment, and attaches files from the evidence folder as evidence (screenshots or a short screen recording; only files in the folder set by ADO_MCP_EVIDENCE_DIR, default ado-test-evidence in the home folder, can be attached; png, jpg, gif, webm, mp4, txt or log, at most ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB each). Get the point ids from testplan_list_test_points. Input is validated before anything is created. The run is always completed, also when some results or attachments failed; the response is marked as an error if anything failed, but everything under 'recorded' exists, so only what is listed under 'failed' should be recorded again, in a new run. Read the run back with testplan_get_test_run_results.`,
     {
       project: z.string().describe("Project ID or project name"),
       planId: z.coerce.number().min(1).describe("ID of the test plan the test points belong to"),
@@ -937,7 +938,7 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
             attachments: z
               .array(
                 z.object({
-                  filePath: z.string().describe("Absolute path to a local file to attach as evidence"),
+                  filePath: z.string().describe("Path to the file in the evidence folder, absolute or relative to the folder"),
                   comment: z.string().optional().describe("Comment shown with the attachment"),
                 })
               )
@@ -965,12 +966,16 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
       }
 
       // Every file is checked before the run is created, so a typo in a path cannot leave a half-recorded run behind.
+      // The checked path is what gets uploaded later, not the path as given.
       const attachmentProblems: string[] = [];
+      const checkedPaths = new Map<string, string>();
       for (const result of results) {
         for (const attachment of result.attachments ?? []) {
-          const problem = await checkAttachmentFile(attachment.filePath);
-          if (problem) {
-            attachmentProblems.push(`point ${result.pointId}: ${attachment.filePath}: ${problem}`);
+          const checked = await checkAttachmentFile(attachment.filePath);
+          if ("problem" in checked) {
+            attachmentProblems.push(`point ${result.pointId}: ${attachment.filePath}: ${checked.problem}`);
+          } else {
+            checkedPaths.set(attachment.filePath, checked.path);
           }
         }
       }
@@ -1046,7 +1051,11 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
           const result = results.find((candidate) => candidate.pointId === entry.pointId);
           for (const attachment of result?.attachments ?? []) {
             try {
-              const content = await readFile(attachment.filePath);
+              const checkedPath = checkedPaths.get(attachment.filePath);
+              if (!checkedPath) {
+                throw new Error("The file was not checked against the evidence folder");
+              }
+              const content = await readFile(checkedPath);
               const reference = await testApi.createTestResultAttachment(
                 {
                   fileName: basename(attachment.filePath),
@@ -1156,27 +1165,55 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
   );
 }
 
-// Returns a reason the file cannot be attached, or undefined when it can.
-async function checkAttachmentFile(filePath: string): Promise<string | undefined> {
+// Attachments are uploaded to the server, so only files in one evidence folder may be sent. Anything else on the
+// machine (credentials, other customers' files) stays out of reach, also if an agent is talked into attaching it.
+function evidenceFolder(): string {
+  return resolve(process.env.ADO_MCP_EVIDENCE_DIR?.trim() || join(homedir(), "ado-test-evidence"));
+}
+
+// Resolves the file inside the evidence folder and checks it can be attached. Returns the resolved path to read
+// from, or the reason it cannot be attached. Relative paths are taken relative to the evidence folder.
+async function checkAttachmentFile(filePath: string): Promise<{ path: string } | { problem: string }> {
   const extension = extname(filePath).toLowerCase();
   if (!attachmentExtensions.has(extension)) {
-    return `unsupported file type '${extension || "(none)"}', use one of ${[...attachmentExtensions].join(", ")}`;
+    return { problem: `unsupported file type '${extension || "(none)"}', use one of ${[...attachmentExtensions].join(", ")}` };
   }
+
+  const folder = evidenceFolder();
+  let realFolder: string;
   try {
-    const info = await stat(filePath);
+    realFolder = await realpath(folder);
+  } catch {
+    return { problem: `the evidence folder ${folder} does not exist; create it and save the evidence there, or set ADO_MCP_EVIDENCE_DIR` };
+  }
+
+  let realFile: string;
+  try {
+    // realpath follows symlinks and junctions, so a link inside the folder cannot point at a file outside it.
+    realFile = await realpath(resolve(folder, filePath));
+  } catch {
+    return { problem: "the file does not exist or cannot be read" };
+  }
+  const relativePath = relative(realFolder, realFile);
+  if (relativePath === "" || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    return { problem: `only files in the evidence folder ${folder} can be attached` };
+  }
+
+  try {
+    const info = await stat(realFile);
     if (!info.isFile()) {
-      return "not a file";
+      return { problem: "not a file" };
     }
     if (info.size === 0) {
-      return "the file is empty";
+      return { problem: "the file is empty" };
     }
     if (info.size > testResultLimits.maxAttachmentBytes) {
-      return `the file is ${Math.ceil(info.size / (1024 * 1024))} MB, the limit is ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB`;
+      return { problem: `the file is ${Math.ceil(info.size / (1024 * 1024))} MB, the limit is ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB` };
     }
   } catch {
-    return "the file does not exist or cannot be read";
+    return { problem: "the file does not exist or cannot be read" };
   }
-  return undefined;
+  return { path: realFile };
 }
 
 /*

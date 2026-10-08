@@ -10,9 +10,9 @@ import { ITestResultsApi } from "azure-devops-node-api/TestResultsApi";
 import { IWorkItemTrackingApi } from "azure-devops-node-api/WorkItemTrackingApi";
 import { ITestApi } from "azure-devops-node-api/TestApi";
 import { z } from "zod";
-import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 
 type TokenProviderMock = () => Promise<string>;
 type ConnectionProviderMock = () => Promise<WebApi>;
@@ -3280,9 +3280,16 @@ describe("configureTestPlanTools", () => {
     let fileDir: string;
     let screenshotPath: string;
     let recordingPath: string;
+    let outsideDir: string;
+    let outsideFile: string;
+    const originalEvidenceDir = process.env.ADO_MCP_EVIDENCE_DIR;
 
     beforeAll(() => {
       fileDir = mkdtempSync(join(tmpdir(), "record-test-results-"));
+      outsideDir = mkdtempSync(join(tmpdir(), "record-test-results-outside-"));
+      outsideFile = join(outsideDir, "pat.txt");
+      writeFileSync(outsideFile, "secret");
+      process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
       screenshotPath = join(fileDir, "OPR-1 passed.png");
       recordingPath = join(fileDir, "opr-2.webm");
       writeFileSync(screenshotPath, "png-bytes");
@@ -3291,6 +3298,12 @@ describe("configureTestPlanTools", () => {
 
     afterAll(() => {
       rmSync(fileDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+      if (originalEvidenceDir === undefined) {
+        delete process.env.ADO_MCP_EVIDENCE_DIR;
+      } else {
+        process.env.ADO_MCP_EVIDENCE_DIR = originalEvidenceDir;
+      }
     });
 
     function getHandler() {
@@ -3434,6 +3447,61 @@ describe("configureTestPlanTools", () => {
       expect(result.content[0].text).toContain("nothing was recorded");
       expect(result.content[0].text).toContain(message);
       expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+    });
+
+    it("accepts a path relative to the evidence folder", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockResolvedValue({ id: 501 });
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "OPR-1 passed.png" }] }] });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenCalledWith(
+        expect.objectContaining({ fileName: "OPR-1 passed.png", stream: Buffer.from("png-bytes").toString("base64") }),
+        "proj1",
+        77,
+        100000
+      );
+    });
+
+    it.each([
+      ["an absolute path outside the folder", () => outsideFile],
+      ["a relative path that climbs out of the folder", () => join("..", basename(outsideDir), "pat.txt")],
+      [
+        "a file reached through a link inside the folder",
+        () => {
+          const link = join(fileDir, "linked");
+          rmSync(link, { recursive: true, force: true });
+          symlinkSync(outsideDir, link, "junction");
+          return join(link, "pat.txt");
+        },
+      ],
+    ])("refuses %s and creates no run", async (_label, makePath) => {
+      const handler = getHandler();
+      const filePath = makePath();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+    });
+
+    it("explains how to set up the evidence folder when it does not exist", async () => {
+      const handler = getHandler();
+      const missingFolder = join(fileDir, "no-such-folder");
+      process.env.ADO_MCP_EVIDENCE_DIR = missingFolder;
+      try {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "shot.png" }] }] });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain(`the evidence folder ${missingFolder} does not exist`);
+        expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      } finally {
+        process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
+      }
     });
 
     it("reports a point the run has no result for, records the others and completes the run", async () => {
