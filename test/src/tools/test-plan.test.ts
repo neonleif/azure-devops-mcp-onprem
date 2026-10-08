@@ -10,6 +10,20 @@ import { ITestResultsApi } from "azure-devops-node-api/TestResultsApi";
 import { IWorkItemTrackingApi } from "azure-devops-node-api/WorkItemTrackingApi";
 import { ITestApi } from "azure-devops-node-api/TestApi";
 import { z } from "zod";
+import { mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "fs";
+import * as fsPromises from "fs/promises";
+import { tmpdir } from "os";
+import { basename, join } from "path";
+
+// readFile passes through to the real one; single tests override it to simulate a file that changed after the check.
+jest.mock("fs/promises", () => {
+  const actual = jest.requireActual("fs/promises");
+  return {
+    ...actual,
+    readFile: jest.fn((...args: unknown[]) => actual.readFile(...args)),
+    realpath: jest.fn((...args: unknown[]) => actual.realpath(...args)),
+  };
+});
 
 type TokenProviderMock = () => Promise<string>;
 type ConnectionProviderMock = () => Promise<WebApi>;
@@ -58,6 +72,13 @@ describe("configureTestPlanTools", () => {
     mockTestApi = {
       addTestCasesToSuite: jest.fn(),
       removeTestCasesFromSuiteUrl: jest.fn(),
+      createTestRun: jest.fn(),
+      getTestResults: jest.fn(),
+      updateTestResults: jest.fn(),
+      createTestResultAttachment: jest.fn(),
+      updateTestRun: jest.fn(),
+      getTestRunById: jest.fn(),
+      getTestResultAttachments: jest.fn(),
     } as unknown as ITestApi;
     mockConnection = {
       getTestPlanApi: jest.fn().mockResolvedValue(mockTestPlanApi),
@@ -87,6 +108,8 @@ describe("configureTestPlanTools", () => {
           "testplan_list_test_points",
           "testplan_show_test_results_from_build_id",
           "testplan_list_test_suites",
+          "testplan_record_test_results",
+          "testplan_get_test_run_results",
         ])
       );
     });
@@ -997,7 +1020,7 @@ describe("configureTestPlanTools", () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.planId).toBe(9105);
       expect(parsed.suiteId).toBe(9241);
-      expect(parsed.summary).toEqual({ total: 2, byOutcome: { Passed: 1, Active: 1 } });
+      expect(parsed.summary).toEqual({ total: 2, byOutcome: { Passed: 1, Active: 1 }, complete: true });
       expect(parsed.testPoints).toEqual([
         {
           id: 279,
@@ -1022,6 +1045,53 @@ describe("configureTestPlanTools", () => {
           lastUpdatedDate: undefined,
         },
       ]);
+    });
+
+    it("counts multiple points with the same outcome", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint, { ...passedPoint, id: 281 }, neverRunPoint]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      expect(JSON.parse(result.content[0].text).summary).toEqual({ total: 3, byOutcome: { Passed: 2, Active: 1 }, complete: true });
+    });
+
+    it("marks the summary incomplete when more pages remain", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([passedPoint], "next-page");
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.continuationToken).toBe("next-page");
+      expect(parsed.summary.complete).toBe(false);
+    });
+
+    it("ignores the DateTime.MinValue completion date of a never-run point and falls back to lastUpdatedDate", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([
+        {
+          ...neverRunPoint,
+          lastUpdatedDate: "2026-09-15T11:40:19.547Z",
+          results: { outcome: "unspecified", lastResultDetails: { dateCompleted: "0001-01-01T00:00:00" } },
+        },
+        { ...neverRunPoint, id: 282, results: { outcome: "unspecified", lastResultDetails: { dateCompleted: "0001-01-01T00:00:00" } } },
+      ]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.testPoints[0].lastUpdatedDate).toBe("2026-09-15T11:40:19.547Z");
+      expect(parsed.testPoints[1].lastUpdatedDate).toBeUndefined();
+    });
+
+    it("keeps the casing of a camelCase multi-word outcome", async () => {
+      const handler = getHandler();
+      mockFetchPointsResponse([{ ...passedPoint, results: { outcome: "notExecuted" } }]);
+
+      const result = await handler({ project: "proj1", planid: 1, suiteid: 2, includePointDetails: false });
+
+      expect(JSON.parse(result.content[0].text).testPoints[0].outcome).toBe("NotExecuted");
     });
 
     it("reports a missing outcome as Active", async () => {
@@ -3215,6 +3285,487 @@ describe("configureTestPlanTools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Error removing test cases from suite");
       expect(result.content[0].text).toContain("API Error");
+    });
+  });
+  describe("record_test_results tool", () => {
+    let fileDir: string;
+    let screenshotPath: string;
+    let recordingPath: string;
+    let outsideDir: string;
+    let outsideFile: string;
+    const originalEvidenceDir = process.env.ADO_MCP_EVIDENCE_DIR;
+
+    beforeAll(() => {
+      fileDir = mkdtempSync(join(tmpdir(), "record-test-results-"));
+      outsideDir = mkdtempSync(join(tmpdir(), "record-test-results-outside-"));
+      outsideFile = join(outsideDir, "pat.txt");
+      writeFileSync(outsideFile, "secret");
+      process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
+      screenshotPath = join(fileDir, "OPR-1 passed.png");
+      recordingPath = join(fileDir, "opr-2.webm");
+      writeFileSync(screenshotPath, "png-bytes");
+      writeFileSync(recordingPath, "webm-bytes");
+    });
+
+    afterAll(() => {
+      rmSync(fileDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+      if (originalEvidenceDir === undefined) {
+        delete process.env.ADO_MCP_EVIDENCE_DIR;
+      } else {
+        process.env.ADO_MCP_EVIDENCE_DIR = originalEvidenceDir;
+      }
+    });
+
+    function getHandler() {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_record_test_results");
+      if (!call) throw new Error("testplan_record_test_results tool not registered");
+      return call[3];
+    }
+
+    function mockRunWithResults(results: { id: number; pointId: number }[]) {
+      (mockTestApi.createTestRun as jest.Mock).mockResolvedValue({ id: 77, webAccessUrl: "https://server/runs/77" });
+      (mockTestApi.getTestResults as jest.Mock).mockResolvedValue(results.map((result) => ({ id: result.id, testPoint: { id: String(result.pointId) } })));
+      (mockTestApi.updateTestResults as jest.Mock).mockResolvedValue([]);
+      (mockTestApi.updateTestRun as jest.Mock).mockResolvedValue({ id: 77, state: "Completed" });
+    }
+
+    it("creates a run on the points, records outcome and comment, attaches the files and completes the run", async () => {
+      const handler = getHandler();
+      mockRunWithResults([
+        { id: 100000, pointId: 11 },
+        { id: 100001, pointId: 12 },
+      ]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockResolvedValueOnce({ id: 501 }).mockResolvedValueOnce({ id: 502 });
+
+      const result = await handler({
+        project: "proj1",
+        planId: 9927,
+        runName: "OPR agent run",
+        results: [
+          { pointId: 11, outcome: "Passed", attachments: [{ filePath: screenshotPath, comment: "After creation" }] },
+          { pointId: 12, outcome: "Failed", comment: "409 message is in English", attachments: [{ filePath: recordingPath }] },
+        ],
+      });
+
+      expect(mockTestApi.createTestRun).toHaveBeenCalledWith({ name: "OPR agent run", plan: { id: "9927" }, pointIds: [11, 12], automated: false, configurationIds: [] }, "proj1");
+      // ResultDetails.Point: without it the point reference that maps results to points is not guaranteed.
+      expect(mockTestApi.getTestResults).toHaveBeenCalledWith("proj1", 77, 8, 0, 200);
+      expect(mockTestApi.updateTestResults).toHaveBeenCalledWith(
+        [
+          { id: 100000, outcome: "Passed", state: "Completed", comment: undefined, completedDate: expect.any(Date) },
+          { id: 100001, outcome: "Failed", state: "Completed", comment: "409 message is in English", completedDate: expect.any(Date) },
+        ],
+        "proj1",
+        77
+      );
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenNthCalledWith(
+        1,
+        { fileName: "OPR-1 passed.png", stream: Buffer.from("png-bytes").toString("base64"), comment: "After creation", attachmentType: "GeneralAttachment" },
+        "proj1",
+        77,
+        100000
+      );
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenNthCalledWith(
+        2,
+        { fileName: "opr-2.webm", stream: Buffer.from("webm-bytes").toString("base64"), comment: undefined, attachmentType: "GeneralAttachment" },
+        "proj1",
+        77,
+        100001
+      );
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      const updateOrder = (mockTestApi.updateTestResults as jest.Mock).mock.invocationCallOrder[0];
+      const attachmentOrder = (mockTestApi.createTestResultAttachment as jest.Mock).mock.invocationCallOrder[0];
+      const completeOrder = (mockTestApi.updateTestRun as jest.Mock).mock.invocationCallOrder[0];
+      expect(updateOrder).toBeLessThan(attachmentOrder);
+      expect(attachmentOrder).toBeLessThan(completeOrder);
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        runId: 77,
+        runUrl: "https://server/runs/77",
+        planId: 9927,
+        recorded: [
+          { pointId: 11, resultId: 100000, outcome: "Passed", attachmentIds: [501] },
+          { pointId: 12, resultId: 100001, outcome: "Failed", attachmentIds: [502] },
+        ],
+        failed: [],
+      });
+    });
+
+    it("names the run after the plan and the date when no name is given", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 1, pointId: 11 }]);
+
+      await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect((mockTestApi.createTestRun as jest.Mock).mock.calls[0][0].name).toMatch(/^9927 manual run \d{4}-\d{2}-\d{2}$/);
+      expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+    });
+
+    it("rejects duplicated point ids before creating a run", async () => {
+      const handler = getHandler();
+
+      const result = await handler({
+        project: "proj1",
+        planId: 9927,
+        results: [
+          { pointId: 11, outcome: "Passed" },
+          { pointId: 11, outcome: "Failed" },
+        ],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("duplicated: 11");
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a missing file", () => join(fileDir, "missing.png"), "does not exist"],
+      [
+        "an unsupported file type",
+        () => {
+          const path = join(fileDir, "notes.exe");
+          writeFileSync(path, "x");
+          return path;
+        },
+        "unsupported file type '.exe'",
+      ],
+      [
+        "an empty file",
+        () => {
+          const path = join(fileDir, "empty.png");
+          writeFileSync(path, "");
+          return path;
+        },
+        "the file is empty",
+      ],
+      [
+        "a file over the size limit",
+        () => {
+          const path = join(fileDir, "long.webm");
+          writeFileSync(path, "");
+          truncateSync(path, 25 * 1024 * 1024 + 1);
+          return path;
+        },
+        "the limit is 25 MB",
+      ],
+    ])("rejects %s before creating a run", async (_label, makePath, message) => {
+      const handler = getHandler();
+      const filePath = makePath();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("nothing was recorded");
+      expect(result.content[0].text).toContain(message);
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+    });
+
+    it("accepts a path relative to the evidence folder", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockResolvedValue({ id: 501 });
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "OPR-1 passed.png" }] }] });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenCalledWith(
+        expect.objectContaining({ fileName: "OPR-1 passed.png", stream: Buffer.from("png-bytes").toString("base64") }),
+        "proj1",
+        77,
+        100000
+      );
+    });
+
+    it.each([
+      ["an absolute path outside the folder", () => outsideFile],
+      ["a relative path that climbs out of the folder", () => join("..", basename(outsideDir), "pat.txt")],
+      [
+        "a file reached through a link inside the folder",
+        () => {
+          const link = join(fileDir, "linked");
+          rmSync(link, { recursive: true, force: true });
+          symlinkSync(outsideDir, link, "junction");
+          return join(link, "pat.txt");
+        },
+      ],
+    ])("refuses %s and creates no run", async (_label, makePath) => {
+      const handler = getHandler();
+      const filePath = makePath();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a UNC path", "\\\\attacker.example\\share\\x.png"],
+      ["a UNC path with forward slashes", "//attacker.example/share/x.png"],
+      ["a device path", "\\\\?\\C:\\Windows\\x.png"],
+      ["a named pipe", "\\\\.\\pipe\\x.png"],
+    ])("refuses %s without touching the file system", async (_label, filePath) => {
+      const handler = getHandler();
+      (fsPromises.realpath as unknown as jest.Mock).mockClear();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      // Opening a UNC path would make Windows authenticate to that host before the path is rejected.
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContainEqual(expect.stringContaining("attacker.example"));
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContainEqual(expect.stringMatching(/^[\\/]{2}/));
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+    });
+
+    it("refuses an absolute path outside the folder before resolving it", async () => {
+      const handler = getHandler();
+      (fsPromises.realpath as unknown as jest.Mock).mockClear();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: outsideFile }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContain(outsideFile);
+    });
+
+    it("explains how to set up the evidence folder when it does not exist", async () => {
+      const handler = getHandler();
+      const missingFolder = join(fileDir, "no-such-folder");
+      process.env.ADO_MCP_EVIDENCE_DIR = missingFolder;
+      try {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "shot.png" }] }] });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain(`the evidence folder ${missingFolder} does not exist`);
+        expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      } finally {
+        process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
+      }
+    });
+
+    it("rejects an empty run name and more than 200 results in the schema", () => {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_record_test_results");
+      const schema = z.object(call[2]);
+      const oneResult = [{ pointId: 11, outcome: "Passed" }];
+
+      expect(schema.safeParse({ project: "proj1", planId: 9927, results: oneResult }).success).toBe(true);
+      expect(schema.safeParse({ project: "proj1", planId: 9927, runName: "", results: oneResult }).success).toBe(false);
+      const tooMany = Array.from({ length: 201 }, (_, index) => ({ pointId: index + 1, outcome: "Passed" }));
+      expect(schema.safeParse({ project: "proj1", planId: 9927, results: tooMany }).success).toBe(false);
+    });
+
+    it("accepts a file whose name starts with two dots", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockResolvedValue({ id: 501 });
+      writeFileSync(join(fileDir, "..final.png"), "png-bytes");
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "..final.png" }] }] });
+
+      expect(result.isError).toBeUndefined();
+      expect(mockTestApi.createTestResultAttachment).toHaveBeenCalledWith(expect.objectContaining({ fileName: "..final.png" }), "proj1", 77, 100000);
+    });
+
+    it("refuses a relative ADO_MCP_EVIDENCE_DIR", async () => {
+      const handler = getHandler();
+      process.env.ADO_MCP_EVIDENCE_DIR = "evidence";
+      try {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: "shot.png" }] }] });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("ADO_MCP_EVIDENCE_DIR must be an absolute path, got 'evidence'");
+        expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+      } finally {
+        process.env.ADO_MCP_EVIDENCE_DIR = fileDir;
+      }
+    });
+
+    it("refuses a file that grew over the limit after it was checked, and keeps the result", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (fsPromises.readFile as unknown as jest.Mock).mockResolvedValueOnce(Buffer.alloc(25 * 1024 * 1024 + 1));
+      {
+        const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: recordingPath }] }] });
+
+        expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+        expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+        const body = JSON.parse(result.content[0].text);
+        expect(body.failed).toEqual([expect.objectContaining({ pointId: 11, step: "attachment", resultId: 100000, error: expect.stringContaining("grew to 26 MB") })]);
+      }
+    });
+
+    it("aborts the run when none of the points has a result in it", async () => {
+      const handler = getHandler();
+      mockRunWithResults([]);
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(mockTestApi.updateTestResults).not.toHaveBeenCalled();
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Aborted" }, "proj1", 77);
+      expect(mockTestApi.updateTestRun).not.toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("none of the test points has a result in the run");
+    });
+
+    it("keeps the recorded results when only completing the run fails", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.updateTestRun as jest.Mock).mockRejectedValue(new Error("TF400001"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledTimes(1);
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.recorded).toEqual([{ pointId: 11, resultId: 100000, outcome: "Passed", attachmentIds: [] }]);
+      expect(body.failed).toEqual([{ pointId: 0, step: "complete", error: "The results are saved, but the run could not be completed and may still be in progress: TF400001" }]);
+    });
+
+    it("reports a point the run has no result for, records the others and completes the run", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+
+      const result = await handler({
+        project: "proj1",
+        planId: 9927,
+        results: [
+          { pointId: 11, outcome: "Passed" },
+          { pointId: 99, outcome: "Passed" },
+        ],
+      });
+
+      expect(mockTestApi.updateTestResults).toHaveBeenCalledWith([expect.objectContaining({ id: 100000, outcome: "Passed" })], "proj1", 77);
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.recorded).toEqual([{ pointId: 11, resultId: 100000, outcome: "Passed", attachmentIds: [] }]);
+      expect(body.failed).toEqual([{ pointId: 99, step: "result", error: "The run has no result for this point; check that it belongs to test plan 9927" }]);
+    });
+
+    it("reports a failed upload and still completes the run", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.createTestResultAttachment as jest.Mock).mockRejectedValue(new Error("Request entity too large"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Failed", attachments: [{ filePath: recordingPath }] }] });
+
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.recorded).toEqual([{ pointId: 11, resultId: 100000, outcome: "Failed", attachmentIds: [] }]);
+      expect(body.failed).toEqual([{ pointId: 11, step: "attachment", resultId: 100000, filePath: recordingPath, error: "Request entity too large" }]);
+    });
+
+    it("aborts the run when the results cannot be updated", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.updateTestResults as jest.Mock).mockRejectedValue(new Error("TF400898"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: screenshotPath }] }] });
+
+      expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+      expect(mockTestApi.updateTestRun).toHaveBeenCalledWith({ state: "Aborted" }, "proj1", 77);
+      expect(mockTestApi.updateTestRun).not.toHaveBeenCalledWith({ state: "Completed" }, "proj1", 77);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error recording test results in test run 77 (the run was aborted; read it with testplan_get_test_run_results to see what was saved): TF400898");
+    });
+
+    it("says so when the run could not be aborted either", async () => {
+      const handler = getHandler();
+      mockRunWithResults([{ id: 100000, pointId: 11 }]);
+      (mockTestApi.updateTestResults as jest.Mock).mockRejectedValue(new Error("TF400898"));
+      (mockTestApi.updateTestRun as jest.Mock).mockRejectedValue(new Error("offline"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(result.content[0].text).toContain("could not be aborted and may still be in progress");
+    });
+
+    it("reports that nothing was recorded when the run cannot be created", async () => {
+      const handler = getHandler();
+      (mockTestApi.createTestRun as jest.Mock).mockRejectedValue(new Error("Plan not found"));
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed" }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error recording test results: could not create the test run, nothing was recorded: Plan not found");
+      expect(mockTestApi.updateTestRun).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("get_test_run_results tool", () => {
+    function getHandler() {
+      configureTestPlanTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "testplan_get_test_run_results");
+      if (!call) throw new Error("testplan_get_test_run_results tool not registered");
+      return call[3];
+    }
+
+    it("returns the run with each result, its point and its attachments", async () => {
+      const handler = getHandler();
+      (mockTestApi.getTestRunById as jest.Mock).mockResolvedValue({ id: 77, name: "OPR agent run", state: "Completed", webAccessUrl: "https://server/runs/77", totalTests: 2, passedTests: 1 });
+      (mockTestApi.getTestResults as jest.Mock).mockResolvedValue([
+        { id: 100000, testPoint: { id: "11" }, testCase: { id: "9975" }, testCaseTitle: "OPR-1", outcome: "Passed", state: "Completed" },
+        { id: 100001, testPoint: { id: "12" }, testCase: { id: "9976" }, testCaseTitle: "OPR-2", outcome: "Failed", state: "Completed", comment: "409 in English" },
+      ]);
+      (mockTestApi.getTestResultAttachments as jest.Mock).mockResolvedValueOnce([{ id: 501, fileName: "opr-1.png", size: 9, comment: "After creation" }]).mockResolvedValueOnce([]);
+
+      const result = await handler({ project: "proj1", runId: 77 });
+
+      expect(mockTestApi.getTestResults).toHaveBeenCalledWith("proj1", 77, 8, 0, 200);
+      expect(mockTestApi.getTestResultAttachments).toHaveBeenCalledWith("proj1", 77, 100000);
+      expect(mockTestApi.getTestResultAttachments).toHaveBeenCalledWith("proj1", 77, 100001);
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        runId: 77,
+        name: "OPR agent run",
+        state: "Completed",
+        runUrl: "https://server/runs/77",
+        totalTests: 2,
+        passedTests: 1,
+        results: [
+          {
+            resultId: 100000,
+            pointId: 11,
+            testCaseId: 9975,
+            testCaseTitle: "OPR-1",
+            outcome: "Passed",
+            state: "Completed",
+            attachments: [{ id: 501, fileName: "opr-1.png", size: 9, comment: "After creation" }],
+          },
+          { resultId: 100001, pointId: 12, testCaseId: 9976, testCaseTitle: "OPR-2", outcome: "Failed", state: "Completed", comment: "409 in English", attachments: [] },
+        ],
+      });
+    });
+
+    it("pages through runs with more results than one page", async () => {
+      const handler = getHandler();
+      (mockTestApi.getTestRunById as jest.Mock).mockResolvedValue({ id: 77 });
+      const firstPage = Array.from({ length: 200 }, (_, index) => ({ id: index + 1, testPoint: { id: String(index + 1000) } }));
+      (mockTestApi.getTestResults as jest.Mock).mockResolvedValueOnce(firstPage).mockResolvedValueOnce([{ id: 201, testPoint: { id: "1200" } }]);
+      (mockTestApi.getTestResultAttachments as jest.Mock).mockResolvedValue([]);
+
+      const result = await handler({ project: "proj1", runId: 77 });
+
+      expect(mockTestApi.getTestResults).toHaveBeenNthCalledWith(1, "proj1", 77, 8, 0, 200);
+      expect(mockTestApi.getTestResults).toHaveBeenNthCalledWith(2, "proj1", 77, 8, 200, 200);
+      expect(JSON.parse(result.content[0].text).results).toHaveLength(201);
+    });
+
+    it("returns an error when the run cannot be read", async () => {
+      const handler = getHandler();
+      (mockTestApi.getTestRunById as jest.Mock).mockRejectedValue(new Error("Run not found"));
+
+      const result = await handler({ project: "proj1", runId: 77 });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error getting test run results: Run not found");
     });
   });
 });

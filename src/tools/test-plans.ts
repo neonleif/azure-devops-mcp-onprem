@@ -1,9 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+import { readFile, realpath, stat } from "fs/promises";
+import { homedir } from "os";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
 import { SuiteEntryTypes, SuiteEntryUpdateParams, TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
+import { ITestApi } from "azure-devops-node-api/TestApi.js";
+import { ResultDetails, TestCaseResult, TestRun } from "azure-devops-node-api/interfaces/TestInterfaces.js";
 import { WorkItemErrorPolicy } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
 import { z } from "zod";
 import { apiVersion } from "../utils.js";
@@ -11,6 +16,10 @@ import { apiVersion } from "../utils.js";
 const concurrencyRetry = { maxRetries: 5, baseDelayMs: 500 };
 // getWorkItems accepts at most 200 ids per request; work item ids are int32; titles are limited to 255 characters.
 const requirementSuiteLimits = { maxRequirementIds: 200, maxWorkItemId: 2147483647, maxSuiteNameLength: 255 };
+// Attachments are sent base64-encoded in a single JSON request, so the file size is capped well below what
+// the server would reject. The cap is a starting point until the on-prem limit has been measured.
+const testResultLimits = { maxResults: 200, maxAttachmentBytes: 25 * 1024 * 1024 };
+const attachmentExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webm", ".mp4", ".txt", ".log"]);
 
 // Retries an operation that failed on a test suite concurrency conflict (TF26071), with exponential backoff and jitter.
 async function withConcurrencyRetry<T>(operation: () => Promise<T>): Promise<T> {
@@ -43,6 +52,8 @@ const Test_Plan_Tools = {
   list_test_suites: "testplan_list_test_suites",
   create_test_suite: "testplan_create_test_suite",
   create_requirement_suites: "testplan_create_requirement_suites",
+  record_test_results: "testplan_record_test_results",
+  get_test_run_results: "testplan_get_test_run_results",
 };
 
 function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider?: () => string) {
@@ -717,13 +728,14 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
         const result: {
           planId: number;
           suiteId: number;
-          summary: { total: number; byOutcome: Record<string, number> };
+          summary: { total: number; byOutcome: Record<string, number>; complete: boolean };
           testPoints: unknown[];
           continuationToken?: string;
         } = {
           planId: planid,
           suiteId: suiteid,
-          summary: summariseTestPointOutcomes(points),
+          // The counts cover this page only; complete is false while more pages remain.
+          summary: { ...summariseTestPointOutcomes(points), complete: !nextToken },
           testPoints: includePointDetails ? points : points.map(compactTestPoint),
         };
         if (nextToken) {
@@ -909,6 +921,350 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
       }
     }
   );
+
+  server.tool(
+    Test_Plan_Tools.record_test_results,
+    `Records the outcome of manually executed test points as one completed test run in a test plan. For each test point it sets the outcome and an optional comment, and attaches files from the evidence folder as evidence (screenshots or a short screen recording; only files in the folder set by ADO_MCP_EVIDENCE_DIR, default ado-test-evidence in the home folder, can be attached; png, jpg, gif, webm, mp4, txt or log, at most ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB each). Get the point ids from testplan_list_test_points. Input is validated before anything is created. The run is completed when at least one result was recorded, also if some results or attachments failed; the response is then marked as an error, but everything under 'recorded' exists. Points that failed at step 'result' should be recorded again in a new run. A failed attachment belongs to a result that was recorded (its resultId is given) and should be added to that result, not recorded again, which would create a second result for the same execution. Read the run back with testplan_get_test_run_results.`,
+    {
+      project: z.string().describe("Project ID or project name"),
+      planId: z.coerce.number().min(1).describe("ID of the test plan the test points belong to"),
+      runName: z.string().min(1).optional().describe("Name of the test run. Defaults to '<planId> manual run <date>'."),
+      results: z
+        .array(
+          z.object({
+            pointId: z.coerce.number().min(1).describe("ID of the test point, as returned by testplan_list_test_points"),
+            outcome: z.enum(["Passed", "Failed", "Blocked", "NotApplicable"]).describe("Outcome of the test point"),
+            comment: z.string().optional().describe("Comment on the result, for example what was observed when the test failed"),
+            attachments: z
+              .array(
+                z.object({
+                  filePath: z.string().describe("Path to the file in the evidence folder, absolute or relative to the folder"),
+                  comment: z.string().optional().describe("Comment shown with the attachment"),
+                })
+              )
+              .optional()
+              .describe("Files to attach to the result as evidence"),
+          })
+        )
+        .min(1)
+        .max(testResultLimits.maxResults)
+        .describe(`One entry per test point, at most ${testResultLimits.maxResults} per run. Each point may appear only once.`),
+    },
+    async ({ project, planId, runName, results }) => {
+      const pointIds = results.map((result) => result.pointId);
+      const duplicates = [...new Set(pointIds.filter((pointId, index) => pointIds.indexOf(pointId) !== index))];
+      if (duplicates.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error recording test results: each pointId may appear only once, duplicated: ${duplicates.join(", ")}` }],
+          isError: true,
+        };
+      }
+
+      // Every file is checked before the run is created, so a typo in a path cannot leave a half-recorded run behind.
+      // The checked path is what gets uploaded later, not the path as given.
+      const attachmentProblems: string[] = [];
+      const checkedPaths = new Map<string, string>();
+      for (const result of results) {
+        for (const attachment of result.attachments ?? []) {
+          const checked = await checkAttachmentFile(attachment.filePath);
+          if ("problem" in checked) {
+            attachmentProblems.push(`point ${result.pointId}: ${attachment.filePath}: ${checked.problem}`);
+          } else {
+            checkedPaths.set(attachment.filePath, checked.path);
+          }
+        }
+      }
+      if (attachmentProblems.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error recording test results: nothing was recorded, fix the attachments first:\n${attachmentProblems.join("\n")}` }],
+          isError: true,
+        };
+      }
+
+      let testApi: ITestApi;
+      let run: TestRun;
+      try {
+        const connection = await connectionProvider();
+        testApi = await connection.getTestApi();
+        run = await testApi.createTestRun(
+          {
+            name: runName ?? `${planId} manual run ${new Date().toISOString().slice(0, 10)}`,
+            plan: { id: String(planId) },
+            pointIds,
+            automated: false,
+            // Required by the RunCreateModel type; the configurations come from the points themselves.
+            configurationIds: [],
+          },
+          project
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error recording test results: could not create the test run, nothing was recorded: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+
+      const runId = run?.id;
+      if (!runId) {
+        return {
+          content: [{ type: "text", text: "Error recording test results: the server did not return a test run id" }],
+          isError: true,
+        };
+      }
+
+      const recorded: { pointId: number; resultId: number; outcome: string; attachmentIds: number[] }[] = [];
+      const failed: { pointId: number; step: string; resultId?: number; filePath?: string; error: string }[] = [];
+
+      try {
+        // Creating a run from point ids makes one pending result per point. Point details are requested
+        // explicitly, because the point reference is what maps each pending result back to its point.
+        const runResults = await testApi.getTestResults(project, runId, ResultDetails.Point, 0, testResultLimits.maxResults);
+        const resultIdByPoint = new Map<number, number>();
+        for (const runResult of runResults ?? []) {
+          const pointId = Number(runResult?.testPoint?.id);
+          if (runResult?.id !== undefined && Number.isFinite(pointId)) {
+            resultIdByPoint.set(pointId, runResult.id);
+          }
+        }
+
+        const updates: TestCaseResult[] = [];
+        for (const result of results) {
+          const resultId = resultIdByPoint.get(result.pointId);
+          if (resultId === undefined) {
+            failed.push({ pointId: result.pointId, step: "result", error: `The run has no result for this point; check that it belongs to test plan ${planId}` });
+            continue;
+          }
+          updates.push({ id: resultId, outcome: result.outcome, state: "Completed", comment: result.comment, completedDate: new Date() });
+          recorded.push({ pointId: result.pointId, resultId, outcome: result.outcome, attachmentIds: [] });
+        }
+        if (updates.length === 0) {
+          throw new Error(`none of the test points has a result in the run; check that they belong to test plan ${planId}`);
+        }
+        await testApi.updateTestResults(updates, project, runId);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        // Abort rather than complete or leave the run in progress: nothing in it can be trusted as recorded.
+        let aborted = true;
+        try {
+          await testApi.updateTestRun({ state: "Aborted" }, project, runId);
+        } catch {
+          aborted = false;
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error recording test results in test run ${runId} (${aborted ? "the run was aborted" : "the run could not be aborted and may still be in progress"}; read it with testplan_get_test_run_results to see what was saved): ${errorMessage}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Sequential on purpose: each file is read into memory and sent as one request.
+      for (const entry of recorded) {
+        const result = results.find((candidate) => candidate.pointId === entry.pointId);
+        for (const attachment of result?.attachments ?? []) {
+          try {
+            const checkedPath = checkedPaths.get(attachment.filePath);
+            if (!checkedPath) {
+              throw new Error("The file was not checked against the evidence folder");
+            }
+            const content = await readFile(checkedPath);
+            // The size was checked before the run was created; a recording still being written can have grown since.
+            if (content.length > testResultLimits.maxAttachmentBytes) {
+              throw new Error(`The file grew to ${Math.ceil(content.length / (1024 * 1024))} MB after it was checked, the limit is ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB`);
+            }
+            const reference = await testApi.createTestResultAttachment(
+              {
+                fileName: basename(checkedPath),
+                stream: content.toString("base64"),
+                comment: attachment.comment,
+                attachmentType: "GeneralAttachment",
+              },
+              project,
+              runId,
+              entry.resultId
+            );
+            if (reference?.id !== undefined) {
+              entry.attachmentIds.push(reference.id);
+            }
+          } catch (error) {
+            failed.push({
+              pointId: entry.pointId,
+              step: "attachment",
+              resultId: entry.resultId,
+              filePath: attachment.filePath,
+              error: error instanceof Error ? error.message : "Unknown error occurred",
+            });
+          }
+        }
+      }
+
+      // The results are saved at this point, so a failed completion is reported alongside them instead of aborting.
+      try {
+        await testApi.updateTestRun({ state: "Completed" }, project, runId);
+      } catch (error) {
+        failed.push({
+          pointId: 0,
+          step: "complete",
+          error: `The results are saved, but the run could not be completed and may still be in progress: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
+        });
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ runId, runUrl: run.webAccessUrl, planId, recorded, failed }, null, 2) }],
+        ...(failed.length > 0 ? { isError: true } : {}),
+      };
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.get_test_run_results,
+    "Gets a test run with its results and the files attached to each result. Use it to read back what testplan_record_test_results recorded.",
+    {
+      project: z.string().describe("Project ID or project name"),
+      runId: z.coerce.number().min(1).describe("ID of the test run"),
+    },
+    async ({ project, runId }) => {
+      try {
+        const connection = await connectionProvider();
+        const testApi = await connection.getTestApi();
+        const run = await testApi.getTestRunById(project, runId);
+        const runResults: TestCaseResult[] = [];
+        for (let skip = 0; ; skip += testResultLimits.maxResults) {
+          const page = await testApi.getTestResults(project, runId, ResultDetails.Point, skip, testResultLimits.maxResults);
+          runResults.push(...(page ?? []));
+          if (!page || page.length < testResultLimits.maxResults) {
+            break;
+          }
+        }
+
+        const resultsWithAttachments = [];
+        for (const runResult of runResults) {
+          const attachments = runResult?.id !== undefined ? await testApi.getTestResultAttachments(project, runId, runResult.id) : [];
+          resultsWithAttachments.push({
+            resultId: runResult?.id,
+            pointId: runResult?.testPoint?.id !== undefined ? Number(runResult.testPoint.id) : undefined,
+            testCaseId: runResult?.testCase?.id !== undefined ? Number(runResult.testCase.id) : undefined,
+            testCaseTitle: runResult?.testCaseTitle,
+            outcome: runResult?.outcome,
+            state: runResult?.state,
+            comment: runResult?.comment,
+            attachments: (attachments ?? []).map((attachment) => ({ id: attachment.id, fileName: attachment.fileName, size: attachment.size, comment: attachment.comment })),
+          });
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  runId: run?.id ?? runId,
+                  name: run?.name,
+                  state: run?.state,
+                  runUrl: run?.webAccessUrl,
+                  completedDate: run?.completedDate,
+                  totalTests: run?.totalTests,
+                  passedTests: run?.passedTests,
+                  results: resultsWithAttachments,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error getting test run results: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// Attachments are uploaded to the server, so only files in one evidence folder may be sent. Anything else on the
+// machine (credentials, other customers' files) stays out of reach, also if an agent is talked into attaching it.
+function evidenceFolder(): { folder: string } | { problem: string } {
+  const configured = process.env.ADO_MCP_EVIDENCE_DIR?.trim();
+  if (!configured) {
+    return { folder: join(homedir(), "ado-test-evidence") };
+  }
+  // A relative folder would depend on the directory the MCP host happened to start the server in.
+  if (!isAbsolute(configured)) {
+    return { problem: `ADO_MCP_EVIDENCE_DIR must be an absolute path, got '${configured}'` };
+  }
+  return { folder: resolve(configured) };
+}
+
+// True when path is below folder. path.relative compares Windows paths without regard to case and returns an
+// absolute path when the two are on different drives. A name that merely starts with '..' is inside.
+function isInside(folder: string, path: string): boolean {
+  const relativePath = relative(folder, path);
+  return relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
+}
+
+// Resolves the file inside the evidence folder and checks it can be attached. Returns the resolved path to read
+// from, or the reason it cannot be attached. Relative paths are taken relative to the evidence folder.
+async function checkAttachmentFile(filePath: string): Promise<{ path: string } | { problem: string }> {
+  const evidence = evidenceFolder();
+  if ("problem" in evidence) {
+    return evidence;
+  }
+  const folder = evidence.folder;
+  const outsideFolder = { problem: `only files in the evidence folder ${folder} can be attached` };
+
+  // Checked on the text of the path before the file system sees it. Opening a UNC or device path is not harmless
+  // even when it is rejected afterwards: Windows connects to the host and authenticates as the user to do so.
+  // Such paths have a different root than the folder, so path.relative returns them absolute and they fail here.
+  if (!isInside(folder, resolve(folder, filePath))) {
+    return outsideFolder;
+  }
+
+  let realFolder: string;
+  try {
+    realFolder = await realpath(folder);
+  } catch {
+    return { problem: `the evidence folder ${folder} does not exist; create it and save the evidence there, or set ADO_MCP_EVIDENCE_DIR` };
+  }
+
+  let realFile: string;
+  try {
+    // realpath follows symlinks and junctions, so a link inside the folder cannot point at a file outside it.
+    realFile = await realpath(resolve(folder, filePath));
+  } catch {
+    return { problem: "the file does not exist or cannot be read" };
+  }
+  if (!isInside(realFolder, realFile)) {
+    return outsideFolder;
+  }
+
+  // The type is taken from the file that will be uploaded, so a link named shot.png cannot send another kind of file.
+  const extension = extname(realFile).toLowerCase();
+  if (!attachmentExtensions.has(extension)) {
+    return { problem: `unsupported file type '${extension || "(none)"}', use one of ${[...attachmentExtensions].join(", ")}` };
+  }
+
+  try {
+    const info = await stat(realFile);
+    if (!info.isFile()) {
+      return { problem: "not a file" };
+    }
+    if (info.size === 0) {
+      return { problem: "the file is empty" };
+    }
+    if (info.size > testResultLimits.maxAttachmentBytes) {
+      return { problem: `the file is ${Math.ceil(info.size / (1024 * 1024))} MB, the limit is ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB` };
+    }
+  } catch {
+    return { problem: "the file does not exist or cannot be read" };
+  }
+  return { path: realFile };
 }
 
 /*
@@ -1000,6 +1356,15 @@ function normaliseTestPointOutcome(rawOutcome: unknown): string {
   return outcome.charAt(0).toUpperCase() + outcome.slice(1);
 }
 
+// Azure DevOps fills a date that was never set with .NET's DateTime.MinValue, so a point that has never
+// been run reports dateCompleted as "0001-01-01T00:00:00". Treat that as missing so the fallback is used.
+function knownDate(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.startsWith("0001-01-01")) {
+    return undefined;
+  }
+  return value;
+}
+
 function compactTestPoint(point: any) {
   const testCase = point?.testCaseReference ?? point?.testCase;
   const results = point?.results;
@@ -1013,7 +1378,7 @@ function compactTestPoint(point: any) {
     tester: point?.tester?.displayName,
     configuration: point?.configuration?.name,
     isAutomated: point?.isAutomated,
-    lastUpdatedDate: results?.lastResultDetails?.dateCompleted ?? point?.lastUpdatedDate,
+    lastUpdatedDate: knownDate(results?.lastResultDetails?.dateCompleted) ?? knownDate(point?.lastUpdatedDate),
   };
 }
 
