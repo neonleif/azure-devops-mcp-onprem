@@ -1,9 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+import { readFile, stat } from "fs/promises";
+import { basename, extname } from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
 import { SuiteEntryTypes, SuiteEntryUpdateParams, TestPlanCreateParams, TestSuiteType } from "azure-devops-node-api/interfaces/TestPlanInterfaces.js";
+import { ITestApi } from "azure-devops-node-api/TestApi.js";
+import { ResultDetails, TestCaseResult, TestRun } from "azure-devops-node-api/interfaces/TestInterfaces.js";
 import { WorkItemErrorPolicy } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
 import { z } from "zod";
 import { apiVersion } from "../utils.js";
@@ -11,6 +15,10 @@ import { apiVersion } from "../utils.js";
 const concurrencyRetry = { maxRetries: 5, baseDelayMs: 500 };
 // getWorkItems accepts at most 200 ids per request; work item ids are int32; titles are limited to 255 characters.
 const requirementSuiteLimits = { maxRequirementIds: 200, maxWorkItemId: 2147483647, maxSuiteNameLength: 255 };
+// Attachments are sent base64-encoded in a single JSON request, so the file size is capped well below what
+// the server would reject. The cap is a starting point until the on-prem limit has been measured.
+const testResultLimits = { maxResults: 200, maxAttachmentBytes: 25 * 1024 * 1024 };
+const attachmentExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webm", ".mp4", ".txt", ".log"]);
 
 // Retries an operation that failed on a test suite concurrency conflict (TF26071), with exponential backoff and jitter.
 async function withConcurrencyRetry<T>(operation: () => Promise<T>): Promise<T> {
@@ -43,6 +51,8 @@ const Test_Plan_Tools = {
   list_test_suites: "testplan_list_test_suites",
   create_test_suite: "testplan_create_test_suite",
   create_requirement_suites: "testplan_create_requirement_suites",
+  record_test_results: "testplan_record_test_results",
+  get_test_run_results: "testplan_get_test_run_results",
 };
 
 function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider?: () => string) {
@@ -910,6 +920,263 @@ function configureTestPlanTools(server: McpServer, tokenProvider: () => Promise<
       }
     }
   );
+
+  server.tool(
+    Test_Plan_Tools.record_test_results,
+    `Records the outcome of manually executed test points as one completed test run in a test plan. For each test point it sets the outcome and an optional comment, and attaches local files as evidence (screenshots or a short screen recording; png, jpg, gif, webm, mp4, txt or log, at most ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB each). Get the point ids from testplan_list_test_points. Input is validated before anything is created. The run is always completed, also when some results or attachments failed; the response is marked as an error if anything failed, but everything under 'recorded' exists, so only what is listed under 'failed' should be recorded again, in a new run. Read the run back with testplan_get_test_run_results.`,
+    {
+      project: z.string().describe("Project ID or project name"),
+      planId: z.coerce.number().min(1).describe("ID of the test plan the test points belong to"),
+      runName: z.string().optional().describe("Name of the test run. Defaults to '<planId> manual run <date>'."),
+      results: z
+        .array(
+          z.object({
+            pointId: z.coerce.number().min(1).describe("ID of the test point, as returned by testplan_list_test_points"),
+            outcome: z.enum(["Passed", "Failed", "Blocked", "NotApplicable"]).describe("Outcome of the test point"),
+            comment: z.string().optional().describe("Comment on the result, for example what was observed when the test failed"),
+            attachments: z
+              .array(
+                z.object({
+                  filePath: z.string().describe("Absolute path to a local file to attach as evidence"),
+                  comment: z.string().optional().describe("Comment shown with the attachment"),
+                })
+              )
+              .optional()
+              .describe("Files to attach to the result as evidence"),
+          })
+        )
+        .min(1)
+        .describe(`One entry per test point, at most ${testResultLimits.maxResults} per run. Each point may appear only once.`),
+    },
+    async ({ project, planId, runName, results }) => {
+      const pointIds = results.map((result) => result.pointId);
+      const duplicates = [...new Set(pointIds.filter((pointId, index) => pointIds.indexOf(pointId) !== index))];
+      if (duplicates.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error recording test results: each pointId may appear only once, duplicated: ${duplicates.join(", ")}` }],
+          isError: true,
+        };
+      }
+      if (results.length > testResultLimits.maxResults) {
+        return {
+          content: [{ type: "text", text: `Error recording test results: at most ${testResultLimits.maxResults} test points per run, got ${results.length}` }],
+          isError: true,
+        };
+      }
+
+      // Every file is checked before the run is created, so a typo in a path cannot leave a half-recorded run behind.
+      const attachmentProblems: string[] = [];
+      for (const result of results) {
+        for (const attachment of result.attachments ?? []) {
+          const problem = await checkAttachmentFile(attachment.filePath);
+          if (problem) {
+            attachmentProblems.push(`point ${result.pointId}: ${attachment.filePath}: ${problem}`);
+          }
+        }
+      }
+      if (attachmentProblems.length > 0) {
+        return {
+          content: [{ type: "text", text: `Error recording test results: nothing was recorded, fix the attachments first:\n${attachmentProblems.join("\n")}` }],
+          isError: true,
+        };
+      }
+
+      let testApi: ITestApi;
+      let run: TestRun;
+      try {
+        const connection = await connectionProvider();
+        testApi = await connection.getTestApi();
+        run = await testApi.createTestRun(
+          {
+            name: runName ?? `${planId} manual run ${new Date().toISOString().slice(0, 10)}`,
+            plan: { id: String(planId) },
+            pointIds,
+            automated: false,
+            // Required by the RunCreateModel type; the configurations come from the points themselves.
+            configurationIds: [],
+          },
+          project
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error recording test results: could not create the test run, nothing was recorded: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+
+      const runId = run?.id;
+      if (!runId) {
+        return {
+          content: [{ type: "text", text: "Error recording test results: the server did not return a test run id" }],
+          isError: true,
+        };
+      }
+
+      const recorded: { pointId: number; resultId: number; outcome: string; attachmentIds: number[] }[] = [];
+      const failed: { pointId: number; step: string; filePath?: string; error: string }[] = [];
+
+      try {
+        // Creating a run from point ids makes one pending result per point; look them up to update them.
+        const runResults = await testApi.getTestResults(project, runId, undefined, 0, testResultLimits.maxResults);
+        const resultIdByPoint = new Map<number, number>();
+        for (const runResult of runResults ?? []) {
+          const pointId = Number(runResult?.testPoint?.id);
+          if (runResult?.id !== undefined && Number.isFinite(pointId)) {
+            resultIdByPoint.set(pointId, runResult.id);
+          }
+        }
+
+        const updates: TestCaseResult[] = [];
+        for (const result of results) {
+          const resultId = resultIdByPoint.get(result.pointId);
+          if (resultId === undefined) {
+            failed.push({ pointId: result.pointId, step: "result", error: `The run has no result for this point; check that it belongs to test plan ${planId}` });
+            continue;
+          }
+          updates.push({ id: resultId, outcome: result.outcome, state: "Completed", comment: result.comment, completedDate: new Date() });
+          recorded.push({ pointId: result.pointId, resultId, outcome: result.outcome, attachmentIds: [] });
+        }
+        if (updates.length > 0) {
+          await testApi.updateTestResults(updates, project, runId);
+        }
+
+        // Sequential on purpose: each file is read into memory and sent as one request.
+        for (const entry of recorded) {
+          const result = results.find((candidate) => candidate.pointId === entry.pointId);
+          for (const attachment of result?.attachments ?? []) {
+            try {
+              const content = await readFile(attachment.filePath);
+              const reference = await testApi.createTestResultAttachment(
+                {
+                  fileName: basename(attachment.filePath),
+                  stream: content.toString("base64"),
+                  comment: attachment.comment,
+                  attachmentType: "GeneralAttachment",
+                },
+                project,
+                runId,
+                entry.resultId
+              );
+              if (reference?.id !== undefined) {
+                entry.attachmentIds.push(reference.id);
+              }
+            } catch (error) {
+              failed.push({ pointId: entry.pointId, step: "attachment", filePath: attachment.filePath, error: error instanceof Error ? error.message : "Unknown error occurred" });
+            }
+          }
+        }
+
+        await testApi.updateTestRun({ state: "Completed" }, project, runId);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        // Abort rather than leave the run in progress, so it does not count as an open run in the plan.
+        let aborted = true;
+        try {
+          await testApi.updateTestRun({ state: "Aborted" }, project, runId);
+        } catch {
+          aborted = false;
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error recording test results in test run ${runId} (${aborted ? "the run was aborted" : "the run could not be aborted and may still be in progress"}): ${errorMessage}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ runId, runUrl: run.webAccessUrl, planId, recorded, failed }, null, 2) }],
+        ...(failed.length > 0 ? { isError: true } : {}),
+      };
+    }
+  );
+
+  server.tool(
+    Test_Plan_Tools.get_test_run_results,
+    "Gets a test run with its results and the files attached to each result. Use it to read back what testplan_record_test_results recorded.",
+    {
+      project: z.string().describe("Project ID or project name"),
+      runId: z.coerce.number().min(1).describe("ID of the test run"),
+    },
+    async ({ project, runId }) => {
+      try {
+        const connection = await connectionProvider();
+        const testApi = await connection.getTestApi();
+        const run = await testApi.getTestRunById(project, runId);
+        const runResults = await testApi.getTestResults(project, runId, ResultDetails.Point, 0, testResultLimits.maxResults);
+
+        const resultsWithAttachments = [];
+        for (const runResult of runResults ?? []) {
+          const attachments = runResult?.id !== undefined ? await testApi.getTestResultAttachments(project, runId, runResult.id) : [];
+          resultsWithAttachments.push({
+            resultId: runResult?.id,
+            pointId: runResult?.testPoint?.id !== undefined ? Number(runResult.testPoint.id) : undefined,
+            testCaseId: runResult?.testCase?.id !== undefined ? Number(runResult.testCase.id) : undefined,
+            testCaseTitle: runResult?.testCaseTitle,
+            outcome: runResult?.outcome,
+            state: runResult?.state,
+            comment: runResult?.comment,
+            attachments: (attachments ?? []).map((attachment) => ({ id: attachment.id, fileName: attachment.fileName, size: attachment.size, comment: attachment.comment })),
+          });
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  runId: run?.id ?? runId,
+                  name: run?.name,
+                  state: run?.state,
+                  runUrl: run?.webAccessUrl,
+                  completedDate: run?.completedDate,
+                  totalTests: run?.totalTests,
+                  passedTests: run?.passedTests,
+                  results: resultsWithAttachments,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return {
+          content: [{ type: "text", text: `Error getting test run results: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// Returns a reason the file cannot be attached, or undefined when it can.
+async function checkAttachmentFile(filePath: string): Promise<string | undefined> {
+  const extension = extname(filePath).toLowerCase();
+  if (!attachmentExtensions.has(extension)) {
+    return `unsupported file type '${extension || "(none)"}', use one of ${[...attachmentExtensions].join(", ")}`;
+  }
+  try {
+    const info = await stat(filePath);
+    if (!info.isFile()) {
+      return "not a file";
+    }
+    if (info.size === 0) {
+      return "the file is empty";
+    }
+    if (info.size > testResultLimits.maxAttachmentBytes) {
+      return `the file is ${Math.ceil(info.size / (1024 * 1024))} MB, the limit is ${testResultLimits.maxAttachmentBytes / (1024 * 1024)} MB`;
+    }
+  } catch {
+    return "the file does not exist or cannot be read";
+  }
+  return undefined;
 }
 
 /*

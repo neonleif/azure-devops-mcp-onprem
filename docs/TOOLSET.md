@@ -56,6 +56,8 @@
 | Test Plans        | [mcp_ado_testplan_reorder_suite_entries](#mcp_ado_testplan_reorder_suite_entries)                         | Set the order of test cases and child suites in a suite           |
 | Test Plans        | [mcp_ado_testplan_list_test_cases](#mcp_ado_testplan_list_test_cases)                                     | List test cases in a test suite                                   |
 | Test Plans        | [mcp_ado_testplan_list_test_points](#mcp_ado_testplan_list_test_points)                                   | Read execution outcome per test point in a suite                  |
+| Test Plans        | [mcp_ado_testplan_record_test_results](#mcp_ado_testplan_record_test_results)                             | Record manual test outcomes with evidence as one test run         |
+| Test Plans        | [mcp_ado_testplan_get_test_run_results](#mcp_ado_testplan_get_test_run_results)                           | Read back a test run with its results and attachments             |
 | Test Plans        | [mcp_ado_testplan_create_test_case](#mcp_ado_testplan_create_test_case)                                   | Create a new test case work item                                  |
 | Test Plans        | [mcp_ado_testplan_update_test_case_steps](#mcp_ado_testplan_update_test_case_steps)                       | Update steps of an existing test case                             |
 | Test Plans        | [mcp_ado_testplan_show_test_results_from_build_id](#mcp_ado_testplan_show_test_results_from_build_id)     | Get test results for a specific build                             |
@@ -496,6 +498,19 @@ Gets the test points of a test suite together with their execution outcome, so m
 
 - **Required**: `project`, `planid`, `suiteid`
 - **Optional**: `testCaseId`, `includePointDetails`, `continuationToken`
+
+### mcp_ado_testplan_record_test_results
+
+Records the outcome of manually executed test points as one completed test run in a test plan. Each entry sets the outcome (`Passed`, `Failed`, `Blocked` or `NotApplicable`) and an optional comment for one test point, and can attach local files as evidence, such as a screenshot or a short screen recording (png, jpg, gif, webm, mp4, txt or log, at most 25 MB each). Point ids come from `testplan_list_test_points`. Duplicated points and missing, empty, oversized or unsupported files are rejected before anything is created. The run is always completed, also when a result or an attachment failed; everything under `recorded` exists, so only what is listed under `failed` should be recorded again, in a new run. If the results cannot be updated at all, the run is aborted and its id is in the error.
+
+- **Required**: `project`, `planId`, `results` (each: `pointId`, `outcome`, optional `comment` and `attachments` with `filePath` and optional `comment`)
+- **Optional**: `runName`
+
+### mcp_ado_testplan_get_test_run_results
+
+Gets a test run with its results and the files attached to each result: run name, state, link and counts, and per result the point id, test case, outcome, comment and attachments. Use it to read back what `testplan_record_test_results` recorded.
+
+- **Required**: `project`, `runId`
 
 ### mcp_ado_testplan_create_test_case
 
