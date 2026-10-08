@@ -1202,6 +1202,13 @@ function evidenceFolder(): { folder: string } | { problem: string } {
   return { folder: resolve(configured) };
 }
 
+// True when path is below folder. path.relative compares Windows paths without regard to case and returns an
+// absolute path when the two are on different drives. A name that merely starts with '..' is inside.
+function isInside(folder: string, path: string): boolean {
+  const relativePath = relative(folder, path);
+  return relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
+}
+
 // Resolves the file inside the evidence folder and checks it can be attached. Returns the resolved path to read
 // from, or the reason it cannot be attached. Relative paths are taken relative to the evidence folder.
 async function checkAttachmentFile(filePath: string): Promise<{ path: string } | { problem: string }> {
@@ -1210,6 +1217,15 @@ async function checkAttachmentFile(filePath: string): Promise<{ path: string } |
     return evidence;
   }
   const folder = evidence.folder;
+  const outsideFolder = { problem: `only files in the evidence folder ${folder} can be attached` };
+
+  // Checked on the text of the path before the file system sees it. Opening a UNC or device path is not harmless
+  // even when it is rejected afterwards: Windows connects to the host and authenticates as the user to do so.
+  // Such paths have a different root than the folder, so path.relative returns them absolute and they fail here.
+  if (!isInside(folder, resolve(folder, filePath))) {
+    return outsideFolder;
+  }
+
   let realFolder: string;
   try {
     realFolder = await realpath(folder);
@@ -1224,9 +1240,8 @@ async function checkAttachmentFile(filePath: string): Promise<{ path: string } |
   } catch {
     return { problem: "the file does not exist or cannot be read" };
   }
-  const relativePath = relative(realFolder, realFile);
-  if (relativePath === "" || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
-    return { problem: `only files in the evidence folder ${folder} can be attached` };
+  if (!isInside(realFolder, realFile)) {
+    return outsideFolder;
   }
 
   // The type is taken from the file that will be uploaded, so a link named shot.png cannot send another kind of file.

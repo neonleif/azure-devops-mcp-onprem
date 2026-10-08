@@ -18,7 +18,11 @@ import { basename, join } from "path";
 // readFile passes through to the real one; single tests override it to simulate a file that changed after the check.
 jest.mock("fs/promises", () => {
   const actual = jest.requireActual("fs/promises");
-  return { ...actual, readFile: jest.fn((...args: unknown[]) => actual.readFile(...args)) };
+  return {
+    ...actual,
+    readFile: jest.fn((...args: unknown[]) => actual.readFile(...args)),
+    realpath: jest.fn((...args: unknown[]) => actual.realpath(...args)),
+  };
 });
 
 type TokenProviderMock = () => Promise<string>;
@@ -3496,6 +3500,36 @@ describe("configureTestPlanTools", () => {
       expect(result.content[0].text).toContain("only files in the evidence folder");
       expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
       expect(mockTestApi.createTestResultAttachment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a UNC path", "\\\\attacker.example\\share\\x.png"],
+      ["a UNC path with forward slashes", "//attacker.example/share/x.png"],
+      ["a device path", "\\\\?\\C:\\Windows\\x.png"],
+      ["a named pipe", "\\\\.\\pipe\\x.png"],
+    ])("refuses %s without touching the file system", async (_label, filePath) => {
+      const handler = getHandler();
+      (fsPromises.realpath as unknown as jest.Mock).mockClear();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      // Opening a UNC path would make Windows authenticate to that host before the path is rejected.
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContainEqual(expect.stringContaining("attacker.example"));
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContainEqual(expect.stringMatching(/^[\\/]{2}/));
+      expect(mockTestApi.createTestRun).not.toHaveBeenCalled();
+    });
+
+    it("refuses an absolute path outside the folder before resolving it", async () => {
+      const handler = getHandler();
+      (fsPromises.realpath as unknown as jest.Mock).mockClear();
+
+      const result = await handler({ project: "proj1", planId: 9927, results: [{ pointId: 11, outcome: "Passed", attachments: [{ filePath: outsideFile }] }] });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("only files in the evidence folder");
+      expect((fsPromises.realpath as unknown as jest.Mock).mock.calls.map(([path]) => String(path))).not.toContain(outsideFile);
     });
 
     it("explains how to set up the evidence folder when it does not exist", async () => {
